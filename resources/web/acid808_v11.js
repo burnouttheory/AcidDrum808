@@ -1,0 +1,1375 @@
+/* SPDX-License-Identifier: MIT
+ * Acid Drum 808 V1.5.12 -- interactive knobs, compact interface adapter to DrumGroover (Reiner Prokein).
+ * The original 808 voice circuits are retained. V1.3 adds host-side envelope and compressor DSP.
+ * This script is placed AFTER app.js and calls the existing project/engine APIs.
+ */
+(() => {
+  'use strict';
+  const TRACKS = [
+    ['kick',       'BASS DRUM',  'kick'],
+    ['snare',      'SNARE DRUM', 'snare'],
+    ['tomLow',     'LOW TOM',    'tom'],
+    ['tomMid',     'MID TOM',    'tom'],
+    ['tomHi',      'HI TOM',     'tom'],
+    ['snareRimShot','RIM SHOT',  'rim'],
+    ['handClap808','HAND CLAP',  'clap'],
+    ['cowbell808', 'COWBELL',    'bell'],
+    ['crash1',     'CYMBAL',     'cymbal'],
+    ['ohh',        'OPEN HAT',   'hat'],
+    ['chh',        'CLSD HAT',   'hat'],
+    ['accent',     'ACCENT',     'accent'],
+  ];
+  let choice = 'kick';
+  let patternIndex = 0;
+  let bankIndex = 0; // A-D: 8 patterns per bank, each pattern is a separate native block
+  let clipboard = null;
+  let swing = 0;
+  // Each of the 32 patterns has its own active 1..16 step length.
+  const stepCounts = new Map();
+  const currentSteps = () => stepCounts.get(patternId(bankIndex,patternIndex)) || 16;
+  let presetItems=[];
+  let activePresetFolder='';
+  let selectedPresetId='';
+  let selectedPreset='';
+  const ACID808_VERSION='1.5.12';
+  let updateOffer={state:'not-configured',version:'',notes:'',url:''};
+  const updateConfig=()=>globalThis.ACID808_UPDATE_CONFIG||{};
+  const checkVersion=v=>/^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(String(v));
+  function versionCompare(a,b){
+    const aa=String(a).split('.').map(Number),bb=String(b).split('.').map(Number);
+    for(let i=0;i<3;i++)if(aa[i]!==bb[i])return aa[i]>bb[i]?1:-1;
+    return 0;
+  }
+  function validManifestUrl(raw){
+    try {const u=new URL(raw);return u.protocol==='https:' && u.hostname==='raw.githubusercontent.com' && /\/Publication\/latest\.json$/.test(u.pathname);}
+    catch(_){return false;}
+  }
+  function validReleaseUrl(raw){
+    try {const u=new URL(raw);return u.protocol==='https:' && u.hostname==='github.com' && u.pathname.includes('/releases');}
+    catch(_){return false;}
+  }
+  function updateLabel(){
+    const button=$('a808-update');if(!button)return;
+    const en=lang()==='en';
+    const labels={
+      'not-configured':en?'UPDATE: SETUP':'MAJ : À CONFIGURER',
+      'checking':en?'UPDATE: CHECKING':'MAJ : VÉRIFICATION',
+      'offline':en?'UPDATE: OFFLINE':'MAJ : HORS LIGNE',
+      'current':en?'UP TO DATE':'À JOUR',
+      'new':en?'UPDATE AVAILABLE':'MAJ DISPONIBLE'
+    };
+    const status=updateOffer.state;
+    button.textContent=(labels[status]||labels.offline) + (status==='new'?' v'+updateOffer.version:'');
+    button.title=updateOffer.notes || (en?'Click to check GitHub for updates':'Cliquez pour vérifier les mises à jour GitHub');
+    button.dataset.status=status;
+  }
+  async function checkForUpdates(){
+    const manifest=String(updateConfig().manifestUrl||'').trim();
+    if(!validManifestUrl(manifest)){
+      updateOffer={state:'not-configured',version:'',notes:'',url:''};updateLabel();return;
+    }
+    updateOffer={state:'checking',version:'',notes:'',url:''};updateLabel();
+    const controller=new AbortController();
+    const deadline=setTimeout(()=>controller.abort(),6000);
+    try {
+      const resp=await fetch(manifest,{cache:'no-store',signal:controller.signal,redirect:'follow'});
+      if(!resp.ok)throw new Error('HTTP '+resp.status);
+      const body=await resp.text();
+      if(body.length>32768)throw new Error('Manifest too large');
+      const release=JSON.parse(body);
+      if(!checkVersion(release.version)||!validReleaseUrl(release.download_url))throw new Error('Invalid manifest');
+      const newer=versionCompare(release.version,ACID808_VERSION)>0;
+      updateOffer={state:newer?'new':'current',version:release.version,notes:String(release.notes||'').slice(0,350),url:release.download_url};
+    }catch(err){
+      updateOffer={state:'offline',version:'',notes:'',url:''};
+    }finally{clearTimeout(deadline);updateLabel();}
+  }
+  function updateClick(){
+    if(updateOffer.state==='new'&&validReleaseUrl(updateOffer.url)){
+      if(typeof hostBridge!=='undefined' && hostBridge.isEmbedded && hostBridge.send){
+        hostBridge.send('acid808UpdateOpen',{url:updateOffer.url});
+      }else window.open(updateOffer.url,'_blank','noopener,noreferrer');
+      return;
+    }
+    if(updateOffer.state==='not-configured'){
+      toast(phrase('Adresse GitHub des mises à jour non configurée.','GitHub update address not configured.'));
+      return;
+    }
+    checkForUpdates();
+  }
+  const safeStepCount = n => Math.max(1,Math.min(16,Math.round(Number(n)||16)));
+  function setStepCount(n){
+    const length=safeStepCount(n),id=patternId(bankIndex,patternIndex);
+    stepCounts.set(id,length);
+    const b=theBlock(); if(b)b.acid808Steps=length;
+    const select=$('a808-length');if(select)select.value=String(length);
+    applyPatternLoop();
+    if(typeof rebuildFullFromEditedBlocks==='function')rebuildFullFromEditedBlocks();
+    redraw();
+    toast(phrase('Longueur : ','Length: ')+length+phrase(' pas',' steps'));
+  }
+
+  let shell;
+  const knobValues = new Map(); // immediate visual state between host updates
+  let copiedControlValue = null; // independent of preset and project
+  const virtualDecay = new Map(); // 100% = original natural tail, per voice
+  const clamp = (x,a,b) => Math.min(b,Math.max(a,x));
+  const $ = id => document.getElementById(id);
+  const norm = id => id === 'handClap808' || id === 'cowbell808';
+  const BANKS = ['A', 'B', 'C', 'D'];
+  // FL Studio note names: C5=MIDI60. Unique white keys, without channel colors.
+  const WHITE_INSTRUMENTS = [0,2,4,5,7,9,11,12,14,16,17]; // C0..F1
+  const WHITE_PATTERNS = [];
+  for(let note=36;note<=89;note++)if([0,2,4,5,7,9,11].includes(note%12))WHITE_PATTERNS.push(note);
+  if(WHITE_PATTERNS.length!==32)throw Error('MIDI map: 32 patterns expected');
+  const SOUND_IDS = TRACKS.filter(t=>t[0]!=='accent').map(t=>t[0]);
+  let lastPublishedPatterns='';
+  let stepCountsReady=false; // do not overwrite FLP-restored lengths on WebView startup
+  const oldGmNoteFor = id => {
+    if(id==='accent')return null;
+    const m=INSTRUMENT_TABLE?.instruments?.find(x=>x.id===id);
+    const tr=trackList.find(t=>t.id===(id==='handClap808'||id==='cowbell808'?'acid808_custom_'+id:id)||t.customInstrument===id);
+    const n=tr?.gm ?? m?.gm;
+    return Number.isInteger(Number(n)) && n!==undefined && n!==null && Number(n)>=0 && Number(n)<128?Number(n):null;
+  };
+  // Publish DSP-side pattern events on changes and restore: GUI need not stay open.
+  function publishPatterns(){
+    if(!stepCountsReady)return;
+    if(typeof hostBridge==='undefined'||!hostBridge.isEmbedded||!hostBridge.send)return;
+    const patterns=[];
+    for(let bank=0;bank<4;bank++)for(let index=0;index<8;index++){
+      const b=findBlock(patternId(bank,index));const events=[];
+      if(b)for(const id of SOUND_IDS){const gm=oldGmNoteFor(id);if(gm===null)continue;
+        for(const n of (b.data[actualId(id)]||[])){
+          const step=noteStep(n),vel=clamp(Math.round(Number(n.vel)||85),1,127);
+          if(step>=0&&step<16)events.push({step,gm,vel});
+        }
+      }
+      const stepCount=stepCounts.get(patternId(bank,index)) || 16;
+      patterns.push({index:bank*8+index,steps:stepCount,events:events.filter(e=>e.step<stepCount)});
+    }
+    const serial=JSON.stringify(patterns);
+    if(serial!==lastPublishedPatterns){lastPublishedPatterns=serial;hostBridge.send('acid808MidiPatterns',{patterns});}
+  }
+  function publishVoiceMapping(){
+    if(typeof hostBridge==='undefined'||!hostBridge.isEmbedded||!hostBridge.send)return;
+    hostBridge.send('acid808MidiVoiceMap',{notes:SOUND_IDS.map(id=>oldGmNoteFor(id)??-1)});
+  }
+
+  const patternId = (bank, index) => bank === 0 ? 'acid808_pattern_' + index : 'acid808_' + BANKS[bank] + '_pattern_' + index;
+  const theBlock = () => findBlock(patternId(bankIndex, patternIndex));
+  const row = id => INSTRUMENT_TABLE?.instruments?.find(x => x.id === id);
+  const actualId = id => norm(id) ? 'acid808_custom_' + id : id;
+  const group = (id) => id === 'accent' ? 'accent' : (TRACKS.find(t => t[0] === id)?.[2] || 'kick');
+  const lang = () => document.documentElement.getAttribute('data-acid-lang') || 'fr';
+  const phrase = (fr, en) => lang() === 'en' ? en : fr;
+  function noteStep(n) { return Math.round(n.beat * 4); }
+  function beatsForStep(s) { return s / 4 + (s % 2 ? swing * 0.25 / 100 : 0); }
+  function defaultData() {
+    const d = {};
+    trackList.forEach(t => d[t.id] = []);
+    d.accent = [];
+    return d;
+  }
+  function initializePatterns() {
+    const required = ['handClap808', 'cowbell808'];
+    // Custom voices are available in the native engine but need a track to schedule notes.
+    for (const id of required) {
+      if (trackList.some(t => t.customInstrument === id)) continue;
+      const meta = row(id);
+      if (!meta) throw Error('Instrument de percussion absent : ' + id);
+      const next = findUnusedGmNote();
+      trackList.push({ id: actualId(id), label: meta.name, role: 'custom',
+        customInstrument: id, color: DGInstrument.trackHex('custom', 0, 1), gm: next });
+      blocksList.forEach(b => { if (b.data) b.data[actualId(id)] ||= []; });
+    }
+    // Migration: retain all 8 existing V1.1.1 patterns, untouched, as Bank A.
+    for (let bank = 0; bank < 4; bank++) {
+      for (let i = 0; i < 8; i++) {
+        const id = patternId(bank, i);
+        if (findBlock(id)) continue;
+        const data = defaultData();
+        if (bank === 0 && i === 0) {
+          for (const s of [0, 4, 8, 12]) data.kick.push({beat:s/4,vel:110});
+          for (const s of [4, 12]) data.snare.push({beat:s/4,vel:105});
+          for (let s=0;s<16;s+=2) data.chh.push({beat:s/4,vel:79});
+          data.accent.push({beat:0,vel:120},{beat:2,vel:120});
+        }
+        blocksList.push({id, name:'Bank '+BANKS[bank]+' Pattern '+(i+1), generated:false,
+          numerator:4,length:1,turnaroundInterval:0,velocityBuild:0,
+          lockedGroups:{},data});
+      }
+    }
+    const match = /^(?:acid808_pattern_([0-7])|acid808_([BCD])_pattern_([0-7]))$/.exec(activeBlockId || '');
+    if (match) {
+      bankIndex=match[2] ? BANKS.indexOf(match[2]) : 0;
+      patternIndex=Number(match[2] ? match[3] : match[1]);
+    } else { bankIndex=0; patternIndex=0; }
+    for(let bank=0;bank<4;bank++)for(let i=0;i<8;i++){
+      const p=findBlock(patternId(bank,i));
+      stepCounts.set(patternId(bank,i),safeStepCount(p?.acid808Steps||16));
+    }
+    syncCustomInstruments();
+    // Fixed 808 engine, regardless of the last-used DrumGroover engine.
+    if ($('deEngineSelect') && $('deEngineSelect').value !== 'internal') {
+      $('deEngineSelect').value = 'internal';
+      $('deEngineSelect').dispatchEvent(new Event('change', {bubbles:true}));
+    }
+    // The native host scheduler uses this sequence, even though the Song Generator UI is hidden.
+    activatePattern(patternIndex);
+  }
+  function applyPatternLoop(){
+    // Original Song Generator transport stores its loop end in quarter-note beats.
+    // 16 steps = 4 beats; 8 steps = 2 beats. A shorter pattern must not
+    // continue through the silent tail of the original four-beat bar.
+    const beats=currentSteps()/4;
+    if(typeof tlLoopStart!=='undefined')tlLoopStart=0;
+    if(typeof tlLoopEnd!=='undefined')tlLoopEnd=beats;
+  }
+  function activatePattern(i) {
+    patternIndex = i;
+    activeBlockId = patternId(bankIndex, i);
+    if($('a808-length'))$('a808-length').value=String(currentSteps());
+    songEngine.songSequence = [{blockId:activeBlockId,startBar:0,loopCount:1}];
+    applyPatternLoop(); // e.g. eight steps: 0..2 beats, not 0..4 beats
+    if ($('subdivision')) $('subdivision').value = '4';
+    if ($('numerator')) $('numerator').value = '4';
+    if ($('denominator')) $('denominator').value = '4';
+    renderBlockTabs();
+    renderNoteEditor();
+    rebuildFullFromEditedBlocks();
+    redraw();
+    syncAcidSessionImmediately();
+  }
+  function toggleStep(step) {
+    const block = theBlock();
+    if (!block || step >= currentSteps()) return;
+    const id = actualId(choice);
+    withBlockDataUndo('Acid 808: step ' + (step + 1), block, () => {
+      const arr = (block.data[id] ||= []);
+      const k = arr.findIndex(n => noteStep(n) === step);
+      if (k >= 0) arr.splice(k, 1);
+      else arr.push({beat:beatsForStep(step),vel:choice==='accent'?120:85});
+      arr.sort((a,b)=>a.beat-b.beat);
+      if (choice !== 'accent') markTrackManuallyEdited(block,id);
+      block.generated = false;
+    });
+    redraw();
+    if (choice !== 'accent') preview(choice);
+  }
+  // Accent is saved in the note's MIDI velocity (the engine serializes velocity).
+  // For the selected instrument only; pads of all other voices are unaffected.
+  function toggleAccent(step) {
+    if(step>=currentSteps())return;
+    if(choice==='accent'){toast(phrase('Choisir un instrument pour accentuer sa note','Select an instrument to accent its note'));return;}
+    const b=theBlock();if(!b)return;
+    const id=actualId(choice);
+    withBlockDataUndo('Acid 808: accent '+(step+1),b,()=>{
+      const notes=(b.data[id] ||= []);
+      let hit=notes.find(n=>noteStep(n)===step);
+      if(!hit){hit={beat:beatsForStep(step),vel:125};notes.push(hit);notes.sort((a,z)=>a.beat-z.beat);}
+      else hit.vel=Number(hit.vel)>=116 ? 85 : 125;
+      markTrackManuallyEdited(b,id);b.generated=false;
+    });
+    redraw();
+  }
+  function modifyCurrent(label, mutator) {
+    const block = theBlock(); if (!block) return;
+    withBlockDataUndo(label, block, () => {
+      mutator(block);
+      TRACKS.forEach(([id]) => { if (id !== 'accent' && (block.data[actualId(id)]||[]).length) markTrackManuallyEdited(block,actualId(id)); });
+      block.generated=false;
+    });
+    redraw();
+  }
+  function randomize() {
+    modifyCurrent('Acid 808: random', block => {
+      for (const [id] of TRACKS) {
+        if (id === 'accent') continue;
+        const tid = actualId(id);
+        const chance = ({kick:.29,snare:.13,ohh:.06,chh:.48,crash1:.04,handClap808:.06,cowbell808:.07}[id] || .05);
+        block.data[tid] = [];
+        for(let i=0;i<currentSteps();i++) if (Math.random() < chance) block.data[tid].push({beat:beatsForStep(i),vel:75 + Math.floor(Math.random()*46)});
+      }
+      block.data.accent = [0,4,8,12].filter(()=>Math.random()<.65).map(s=>({beat:s/4,vel:120}));
+    });
+  }
+  function clearPattern() {
+    if (!confirm(phrase('Effacer les 16 pas de ce pattern ?', 'Clear all 16 steps in this pattern?'))) return;
+    modifyCurrent('Acid 808: clear pattern', b => {
+      TRACKS.forEach(([id]) => b.data[actualId(id)] = []);
+    });
+  }
+  function copyPattern() {
+    const b=theBlock(); if(!b) return;
+    clipboard=JSON.parse(JSON.stringify(b.data));
+    toast(phrase('Pattern copié','Pattern copied'));
+  }
+  function pastePattern() {
+    if(!clipboard) {toast(phrase('Aucun pattern copié','No pattern copied'));return;}
+    modifyCurrent('Acid 808: paste', b => {
+      TRACKS.forEach(([id]) => {
+        const tid=actualId(id);
+        b.data[tid] = JSON.parse(JSON.stringify(clipboard[tid] || []));
+      });
+    });
+  }
+  function toast(text) { const el=$('a808-message'); if (el) el.textContent=text; }
+  function preview(id) {
+    const r=row(id);
+    if (!r) return;
+    if (norm(id)) deSendMidi('midiNoteOn',{custom:r.paramIndex});
+    else if (r.gm != null) { deSendMidi('midiNoteOn',r.gm); setTimeout(()=>deSendMidi('midiNoteOff',r.gm),115); }
+  }
+  function voiceParameter(rowData, control) {
+    const k=control.key;
+    const v=deVoiceParamStateFor(rowData.family,rowData.paramIndex,k);
+    return (v !== undefined && Number.isFinite(Number(v)))? Number(v) : Number(control.default ?? rowData.defaults[k] ?? control.min);
+  }
+  // On V1.1 the top rotary elements were drawings inside instrument buttons.
+  // V1.3.0 gives each one a real native parameter (level where available).
+  function knobSpec(id) {
+    if (id === 'accent') {
+      const original = $('deAccentAmount');
+      return original ? {
+        key:'accent', min:0, max:100, step:1,
+        get:() => Number(original.value || 0),
+        set:(v, commit) => {
+          original.value=String(v);
+          original.dispatchEvent(new Event('input',{bubbles:true}));
+          if (commit) original.dispatchEvent(new Event('change',{bubbles:true}));
+        }
+      } : null;
+    }
+    const m = row(id);
+    if (!m) return null;
+    const c = (m.controls || []).find(x => ['level','levelKnob','volume','volumeKnob'].includes(x.key));
+    if (c) return {
+      key:c.key, min:Number(c.min), max:Number(c.max),step:Number(c.step) || 0.01,
+      get:() => voiceParameter(m,c),
+      set:(v, commit) => {
+        deSendVoiceParam(m.family,c.key,v,m.paramIndex);
+        if (commit) deSendVoiceParamCommit(m.family,c.key,v,m.paramIndex);
+      }
+    };
+    // Some voices have no circuit Level pot. Use the upstream MIDI-articulation
+    // gain instead of claiming an unsupported synth parameter exists.
+    const voiceTrack = trackList.find(t => t.id===id || t.customInstrument===id);
+    const midiNote = m.gm == null ? voiceTrack?.gm : m.gm;
+    if (midiNote == null) return null;
+    return {
+      key:'articulationLevel',min:0,max:3,step:0.01,
+      get:() => Number(deArticulationGainCache?.[midiNote] ?? 1),
+      set:(v) => { deArticulationGainCache[midiNote]=v; deSendArticulationLevel(midiNote,v); }
+    };
+  }
+  function knobValue(id, spec) {
+    return clamp(knobValues.has(id) ? knobValues.get(id) : spec.get(),spec.min,spec.max);
+  }
+  function drawKnob(id) {
+    const el=$('a808-knob-'+id), spec=knobSpec(id);
+    if (!el || !spec || !Number.isFinite(spec.min) || !Number.isFinite(spec.max) || spec.max<=spec.min) return;
+    const value=knobValue(id,spec);
+    const fraction=(value-spec.min)/(spec.max-spec.min);
+    el.style.setProperty('--a808-angle',(-125+250*fraction).toFixed(2)+'deg');
+    el.setAttribute('aria-valuenow',String(Number(value.toFixed(3))));
+    el.setAttribute('aria-valuemin',String(spec.min));
+    el.setAttribute('aria-valuemax',String(spec.max));
+    el.title='LEVEL : '+value.toFixed(2)+' — '+phrase('glisser haut/bas ou utiliser la molette','drag up/down or use mouse wheel');
+  }
+  function applyKnob(id,raw,commit=false) {
+    const spec=knobSpec(id);
+    if (!spec) return;
+    const increments=Math.round((clamp(Number(raw),spec.min,spec.max)-spec.min)/spec.step);
+    const value=clamp(spec.min+increments*spec.step,spec.min,spec.max);
+    knobValues.set(id,value);
+    spec.set(value,commit);
+    drawKnob(id);
+    // Keep the lower detailed slider synchronized, without sending a duplicate command.
+    if(choice===id) {
+      const detail=$('a808-voice');
+      const slider=detail?.querySelector('input[data-acid-param="'+spec.key+'"]');
+      if(slider) {
+        slider.value=String(value);
+        const output=slider.parentElement?.querySelector('output');
+        if(output) output.textContent=value.toFixed(2);
+      }
+    }
+  }
+  function attachKnob(id,el) {
+    el.setAttribute('role','slider');
+    el.tabIndex=0;
+    el.setAttribute('aria-label',TRACKS.find(t=>t[0]===id)?.[1]+' — volume');
+    const active=knobSpec(id);
+    if (!active) {el.disabled=true;return;}
+    let gesture=null;
+    el.addEventListener('pointerdown',e=>{
+      if(e.button!==0) return;
+      e.preventDefault();e.stopPropagation();
+      choice=id;redraw();
+      const spec=knobSpec(id);
+      gesture={y:e.clientY,value:knobValue(id,spec),changed:false,pointerId:e.pointerId};
+      el.setPointerCapture?.(e.pointerId);
+      el.focus();
+    });
+    el.addEventListener('pointermove',e=>{
+      if(!gesture || e.pointerId!==gesture.pointerId) return;
+      const spec=knobSpec(id);
+      const delta=(gesture.y-e.clientY)/125*(spec.max-spec.min);
+      const candidate=clamp(gesture.value+delta,spec.min,spec.max);
+      if(Math.abs(candidate-knobValue(id,spec))>=spec.step/2) {
+        gesture.changed=true;applyKnob(id,candidate,false);
+      }
+    });
+    const finish=e=>{
+      if(!gesture || e.pointerId!==gesture.pointerId)return;
+      if(gesture.changed) applyKnob(id,knobValue(id,knobSpec(id)),true);
+      gesture=null;
+      try {if(el.hasPointerCapture?.(e.pointerId))el.releasePointerCapture(e.pointerId);}catch(_){}
+    };
+    el.addEventListener('pointerup',finish);
+    el.addEventListener('pointercancel',finish);
+    el.addEventListener('lostpointercapture',e=>{if(gesture&&e.pointerId===gesture.pointerId) finish(e);});
+    el.addEventListener('wheel',e=>{
+      e.preventDefault();e.stopPropagation();
+      const spec=knobSpec(id);
+      const move=e.deltaY<0?1:-1;
+      applyKnob(id,knobValue(id,spec)+move*spec.step*(e.shiftKey?0.25:5),true);
+    },{passive:false});
+    el.addEventListener('keydown',e=>{
+      if(!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;
+      e.preventDefault();e.stopPropagation();
+      const spec=knobSpec(id);
+      const v=e.key==='Home'?spec.min:e.key==='End'?spec.max:
+        knobValue(id,spec)+(['ArrowUp','ArrowRight'].includes(e.key)?1:-1)*spec.step*(e.shiftKey?10:1);
+      applyKnob(id,v,true);
+    });
+    el.addEventListener('dblclick',e=>{
+      e.stopPropagation();
+      const spec=knobSpec(id);
+      const m=row(id);
+      const ctrl=m?.controls?.find(c=>c.key===spec?.key);
+      const def=id==='accent'?0:(ctrl?Number(ctrl.default ?? m.defaults?.[ctrl.key] ?? spec.min):1);
+      applyKnob(id,def,true);
+    });
+    el.addEventListener('click',e=>e.stopPropagation());
+    el.addEventListener('contextmenu',e=>{
+      e.preventDefault();e.stopPropagation();
+      const spec=knobSpec(id);
+      const m=row(id),c=m?.controls?.find(p=>p.key===spec.key);
+      const defaultValue=id==='accent'?0:(c?Number(c.default??m.defaults?.[c.key]??spec.min):1);
+      openControlMenu(e,{
+        name:(TRACKS.find(t=>t[0]===id)?.[1]||id)+' · '+(id==='accent'?'ACCENT':'LEVEL'),
+        min:spec.min,max:spec.max,step:spec.step,defaultValue,
+        get:()=>knobValue(id,knobSpec(id)),set:v=>applyKnob(id,v,true),
+        kind:id==='accent'?'accent':'voice',voiceIndex:SOUND_IDS.indexOf(id),paramKey:spec.key
+      });
+    });
+    drawKnob(id);
+  }
+  // FL Studio 2026 accepts user-defined labels in Piano Roll > View > Keyboard labels.
+  // VST3 host key naming is not guaranteed, so this panel uses actual runtime MIDI numbers.
+  // No silent re-mapping and no misleading "automatic VST3 label" claim.
+  const namesFR={kick:'Grosse caisse',snare:'Caisse claire',tomLow:'Tom grave',tomMid:'Tom medium',tomHi:'Tom aigu',
+    snareRimShot:'Rim Shot',handClap808:'Clap',cowbell808:'Cowbell',crash1:'Cymbale',ohh:'Hi-Hat ouvert',chh:'Hi-Hat ferme'};
+  const midiNoteFor = id => {
+    const index=SOUND_IDS.indexOf(id);
+    return index>=0?WHITE_INSTRUMENTS[index]:null;
+  };
+  function flNoteName(n) {const symbols=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];return symbols[n%12]+Math.floor(n/12);}
+  function midiMappingRows() {
+    return SOUND_IDS.map((id,i)=>({kind:'voice',id,
+      label:lang()==='en'?TRACKS[i][1]:(namesFR[id]||TRACKS[i][1]),note:WHITE_INSTRUMENTS[i]}))
+      .concat(WHITE_PATTERNS.map((note,i)=>({kind:'pattern',
+        label:'BANK '+BANKS[Math.floor(i/8)]+'-'+((i%8)+1),note})));
+  }
+  function midiMappingText() {
+    const lines=[phrase('INSTRUMENTS (touches blanches)','INSTRUMENTS (white keys)')];
+    for(const x of midiMappingRows().filter(x=>x.kind==='voice')) lines.push(x.label+' : '+flNoteName(x.note)+' (MIDI '+x.note+')');
+    lines.push('',phrase('PATTERNS (une note maintenue = un pattern en boucle)','PATTERNS (held note = looping pattern)'));
+    for(const x of midiMappingRows().filter(x=>x.kind==='pattern')) lines.push(x.label+' : '+flNoteName(x.note)+' (MIDI '+x.note+')');
+    return lines.join('\n');
+  }
+  function showMidiMap() {
+    const rows=$('a808-midi-rows');rows.replaceChildren();
+    let group='';
+    midiMappingRows().forEach(x=>{
+      if(x.kind!==group){group=x.kind;const h=document.createElement('h3');h.className='a808-midi-group';
+        h.textContent=group==='voice'?phrase('INSTRUMENTS — C0 à F1','INSTRUMENTS — C0 to F1'):
+          phrase('BANKS A–D — C3 à F7','BANKS A–D — C3 to F7');rows.append(h);}
+      const item=document.createElement('div');item.className='a808-midi-item '+(group==='pattern'?'a808-midi-pattern':'');
+      const label=document.createElement('strong');label.textContent=x.label;
+      const value=document.createElement('span');value.textContent=flNoteName(x.note)+'  /  MIDI '+x.note;
+      item.append(label,value);rows.append(item);
+    });
+    $('a808-midi-instructions').textContent=phrase(
+      '11 instruments sur les touches blanches C0–F1. 32 patterns sur les touches blanches C3–F7. Maintenir une note de pattern pour le jouer en boucle ; sa fin arrête le pattern. ACCENT reste dans la vélocité de la note. Pour afficher les noms directement dans FL Studio : Piano Roll > View > Keyboard labels / Liste, renommer les touches et enregistrer les étiquettes. Aucun canal MIDI spécial requis.',
+      '11 instruments on white keys C0–F1. 32 patterns on white keys C3–F7. Hold a pattern note to loop it; its end stops playback. ACCENT uses MIDI velocity. To label keys in FL Studio, use Piano Roll > View > Keyboard labels / List and save the preset. No special MIDI channel required.');
+    $('a808-midi-modal').hidden=false;
+  }
+  function hideMidiMap() {$('a808-midi-modal').hidden=true;}
+  async function copyMidiMap() {
+    const mapping=midiMappingText();
+    try {
+      if(navigator.clipboard && window.isSecureContext)await navigator.clipboard.writeText(mapping);
+      else {
+        const t=document.createElement('textarea');t.value=mapping;document.body.append(t);t.select();
+        if(!document.execCommand('copy'))throw Error('clipboard unavailable');t.remove();
+      }
+      const b=$('a808-midi-copy');b.textContent=phrase('COPIE !','COPIED!');setTimeout(()=>b.textContent='COPIER LA LISTE',1700);
+    }catch(e){const p=document.createElement('textarea');p.value=mapping;p.rows=12;p.style.width='100%';
+      const container=$('a808-midi-rows');container.replaceChildren(p);p.select();}
+  }
+  function instrumentControls(id) {
+    const el=$('a808-voice'); if(!el) return;
+    el.replaceChildren();
+    if (id==='accent') {
+      const label=document.createElement('div'); label.className='a808-voice-heading';label.textContent='ACCENT'; el.appendChild(label);
+      /* Accent strength is controlled by the upper rotary. The duplicate lower slider is hidden.
+      addSlider(el, phrase('Intensité','Strength'),Number($('deAccentAmount')?.value||0),0,100,1,(v)=>{
+        knobValues.set('accent',Number(v));drawKnob('accent');
+        const original=$('deAccentAmount');if(original){original.value=v;original.dispatchEvent(new Event('input',{bubbles:true}));original.dispatchEvent(new Event('change',{bubbles:true}));}
+      }); */
+      renderComp(el);return;
+    }
+    const meta=row(id);
+    if (!meta) {el.textContent='Voix indisponible';return;}
+    const label=document.createElement('div');label.className='a808-voice-heading'; label.textContent=TRACKS.find(t=>t[0]===id)?.[1]||id; el.appendChild(label);
+    // Display only parameters declared by this instrument's real 808 DSP model.
+    const priority = key => /^(level|levelKnob|volume|volumeKnob)$/.test(key) ? 0
+      : /^tone/i.test(key) ? 1 : /^decay/i.test(key) ? 2
+      : /^tuning/i.test(key) ? 3 : /^snappy/i.test(key) ? 4
+      : /^pitch/i.test(key) ? 5 : 99;
+    const nativeDecay=(meta.controls||[]).find(c=>/^decay/i.test(c.key));
+    const controls=(meta.controls||[]).filter(c=>priority(c.key)<99 && c.key!==knobSpec(id)?.key)
+      .sort((a,b)=>priority(a.key)-priority(b.key));
+    // DECAY on each instrument: original circuit parameter when available,
+    // plus a per-voice output envelope handled in VoicePool.
+    const decaySlider = addSlider(el,phrase('DECAY · Durée','DECAY · Length'),virtualDecay.get(id) ?? 100,0,100,1,(v,commit)=>{
+      virtualDecay.set(id,Number(v));
+      hostBridge.send('acid808Decay',{voice:id,value:Number(v)});
+      if(nativeDecay){
+        const actual=Number(nativeDecay.min)+(Number(nativeDecay.max)-Number(nativeDecay.min))*Number(v)/100;
+        deSendVoiceParam(meta.family,nativeDecay.key,actual,meta.paramIndex);
+        if(commit)deSendVoiceParamCommit(meta.family,nativeDecay.key,actual,meta.paramIndex);
+      }
+    });
+    if(decaySlider) decaySlider.dataset.acidDecay = id;
+    controls.filter(c=>!/^decay/i.test(c.key)).forEach(c=>addSlider(el,c.label,(c.key===knobSpec(id)?.key && knobValues.has(id)) ? knobValues.get(id) : voiceParameter(meta,c),c.min,c.max,c.step,(v,commit)=>{
+      deSendVoiceParam(meta.family,c.key,Number(v),meta.paramIndex);
+      if(c.key===knobSpec(id)?.key) {knobValues.set(id,Number(v));drawKnob(id);}
+      if(commit) deSendVoiceParamCommit(meta.family,c.key,Number(v),meta.paramIndex);
+    }));
+    renderComp(el);
+    const audition=document.createElement('button');audition.className='a808-smallbtn';audition.textContent=phrase('ÉCOUTER','PREVIEW');audition.onclick=()=>preview(id);el.appendChild(audition);
+  }
+  let activeSliderGesture=0;
+  function addSlider(parent,name,value,min,max,step,onChange) {
+    const wrap=document.createElement('label'); wrap.className='a808-param';
+    const title=document.createElement('span');title.textContent=name;
+    const readout=document.createElement('output');readout.textContent=Number(value).toFixed(2);
+    const input=document.createElement('input');input.type='range';input.min=min;input.max=max;input.step=step;input.value=value;
+    if (parent.id==='a808-voice' && choice!=='accent') {
+      const r=row(choice),c=(r?.controls||[]).find(c=>c.label===name);
+      if(c) input.dataset.acidParam=c.key;
+    }
+    input.addEventListener('pointerdown',()=>{activeSliderGesture++;});
+    const release=()=>{activeSliderGesture=Math.max(0,activeSliderGesture-1);};
+    input.addEventListener('pointerup',release);input.addEventListener('pointercancel',release);
+    input.oninput=()=>{readout.textContent=Number(input.value).toFixed(2);onChange(input.value,false);};
+    input.onchange=()=>onChange(input.value,true);
+    input.addEventListener('contextmenu',e=>{
+      e.preventDefault();e.stopPropagation();
+      const id=choice,voiceIndex=SOUND_IDS.indexOf(id);
+      const ctrl=row(id)?.controls?.find(c=>c.label===name);
+      const isDecay=/^decay/i.test(name);
+      openControlMenu(e,{name:(TRACKS.find(t=>t[0]===id)?.[1]||id)+' · '+name,
+        min:Number(min),max:Number(max),step:Number(step)||0.01,
+        defaultValue:Number(ctrl?.default??value),
+        get:()=>Number(input.value),
+        set:v=>{input.value=String(v);readout.textContent=Number(v).toFixed(2);onChange(input.value,false);onChange(input.value,true);},
+        kind:isDecay?'decay':(ctrl?'voice':null),voiceIndex,paramKey:ctrl?.key});
+    });
+    wrap.append(title,input,readout);parent.append(wrap);
+    return input;
+  }
+  function redraw() {
+    if(!shell) return;
+    TRACKS.forEach(([id])=>{
+      const btn=$('a808-inst-'+id);if(btn)btn.classList.toggle('chosen',choice===id);
+      drawKnob(id);
+    });
+    for(let s=0;s<16;s++) {
+      const b=$('a808-step-'+s);if(!b)continue;
+      const hit=(theBlock()?.data[actualId(choice)]||[]).find(n=>noteStep(n)===s);
+      b.classList.toggle('on',Boolean(hit));
+      const a=$('a808-accent-'+s);
+      if(a){a.classList.toggle('on',Boolean(hit && Number(hit.vel)>=116));a.classList.toggle('muted',choice==='accent');}
+    }
+    const caption=$('a808-accent-label');
+    if(caption)caption.textContent='ACCENT · '+(TRACKS.find(t=>t[0]===choice)?.[1]||'INSTRUMENT');
+    for(let i=0;i<8;i++) {
+      const b=$('a808-pat-'+i); if(b) b.classList.toggle('chosen',patternIndex===i);
+    }
+    for(let i=0;i<4;i++) {
+      const b=$('a808-bank-'+i); if(b) b.classList.toggle('chosen',bankIndex===i);
+    }
+    if ($('a808-current')) $('a808-current').textContent='BANK '+BANKS[bankIndex]+' · PATTERN '+(patternIndex+1);
+    if($('a808-length'))$('a808-length').value=String(currentSteps());
+    if($('a808-step-caption'))$('a808-step-caption').textContent=currentSteps()+' '+phrase('PAS JOUÉS','ACTIVE STEPS');
+    for(let s=0;s<16;s++){
+      $('a808-step-'+s)?.classList.toggle('outside',s>=currentSteps());
+      $('a808-accent-'+s)?.classList.toggle('outside',s>=currentSteps());
+    }
+    instrumentControls(choice);
+    publishPatterns();
+  }
+  function updateLocale(){
+    if(!shell)return;
+    const texts={
+      'a808-save-preset':['SAUVER PRESET','SAVE PRESET'],
+      'a808-load-preset':['CHARGER PRESET','LOAD PRESET'],
+      'a808-folder-preset':['DOSSIER','FOLDER'],
+      'a808-midi-help':['MIDI / PIANO ROLL','MIDI / PIANO ROLL'],
+      'a808-import':['IMPORT MIDI','IMPORT MIDI'],
+      'a808-export':['EXPORT MIDI','EXPORT MIDI'],
+      'a808-copy':['COPY','COPY'],
+      'a808-paste':['PASTE','PASTE'],
+      'a808-clear':['CLEAR','CLEAR']
+    };
+    Object.entries(texts).forEach(([id,words])=>{const el=$(id);if(el)el.textContent=lang()==='en'?words[1]:words[0];});
+    const field=$('a808-preset-name');
+    if(field)field.placeholder=phrase('Nom du preset (ex. SAMBA)','Preset name (e.g. SAMBA)');
+    const prev=$('a808-prev-preset'),next=$('a808-next-preset');
+    if(prev){prev.title=phrase('Preset précédent','Previous preset');prev.setAttribute('aria-label',prev.title);}
+    if(next){next.title=phrase('Preset suivant','Next preset');next.setAttribute('aria-label',next.title);}
+    const len=$('a808-length');
+    if(len){
+      const label=len.closest('label');
+      if(label&&label.firstChild&&label.firstChild.nodeType===3)
+        label.firstChild.nodeValue=phrase('NOMBRE DE PAS ','NUMBER OF STEPS ');
+      len.setAttribute('aria-label',phrase('Nombre de pas joués','Number of active steps'));
+    }
+    // Refresh the translated status without erasing the currently loaded catalogue.
+    // V1.5.9 referenced the removed variable `presetNames` here and crashed at startup.
+    refreshPresetNames({items:presetItems, activeFolder:activePresetFolder});
+    updateLabel();
+  }
+  function makeShell() {
+    shell=document.createElement('main');shell.id='acid808Shell';
+    shell.innerHTML=`
+      <div class="a808-mainhead">
+        <div><strong>ACID DRUM <em>808</em></strong><span class="a808-version">V1.5.12</span></div>
+        <div class="a808-playback">
+          <span class="a808-led"></span><span class="a808-sync">FL STUDIO SYNC</span>
+          <button id="a808-play">▶ PLAY</button><button id="a808-stop">■ STOP</button>
+          <button id="a808-fr">FR</button><button id="a808-en">EN</button>
+        </div>
+      </div>
+      <div class="a808-presetbar">
+        <span class="a808-prelabel">PRESET</span>
+        <button id="a808-prev-preset" title="Preset précédent">◀</button>
+        <input id="a808-preset-name" type="text" maxlength="80" placeholder="Nom du preset (ex. SAMBA)" />
+        <button id="a808-next-preset" title="Preset suivant">▶</button>
+        <button id="a808-save-preset">SAUVER PRESET</button>
+        <button id="a808-load-preset">CHARGER PRESET</button>
+        <button id="a808-folder-preset">DOSSIER</button>
+        <button id="a808-update" type="button" title="Vérifier les mises à jour GitHub">MAJ : À CONFIGURER</button>
+        <span id="a808-preset-status"></span>
+      </div>
+      <div class="a808-instr-title"><span>ANALOG RHYTHM MACHINE — 808 CIRCUIT ENGINE</span><span class="a808-hint">${phrase('Choisir une voix, puis activer les pas','Choose a voice, then toggle steps')}</span></div>
+      <section class="a808-instruments" id="a808-instruments"></section>
+      <section class="a808-workbench">
+        <div class="a808-voice" id="a808-voice"></div>
+        <div class="a808-stepzone">
+          <div class="a808-controls">
+            <div class="a808-row"><small>BANK</small><div class="a808-banks" id="a808-banks"></div><small>PATTERN</small><div id="a808-patterns"></div><button id="a808-midi-help" class="a808-smallbtn" type="button">MIDI / PIANO ROLL</button><button id="a808-import" class="a808-smallbtn" type="button">IMPORT MIDI</button><button id="a808-export" class="a808-smallbtn" type="button">EXPORT MIDI</button><input type="file" id="a808-midi-file" hidden accept=".mid,.midi,audio/midi"></div>
+            <div class="a808-row a808-actions">
+              <label class="a808-length-label">NOMBRE DE PAS <select id="a808-length" aria-label="Nombre de pas joués">${Array.from({length:16},(_,i)=>'<option value="'+(i+1)+'">'+(i+1)+'</option>').join('')}</select></label>
+              <button id="a808-copy">COPY</button><button id="a808-paste">PASTE</button>
+              <button id="a808-clear">CLEAR</button><button id="a808-random">RANDOM 16</button>
+              <span class="a808-swing-label">SHUFFLE</span><input id="a808-swing" type="range" min="0" max="45" step="5" value="0"><span id="a808-swing-value">0%</span>
+            </div>
+          </div>
+          <div class="a808-stepheader"><span id="a808-current">PATTERN 1</span><span>4/4 · <span id="a808-step-caption">16 PAS JOUÉS</span></span></div>
+          <div class="a808-accentbar"><span id="a808-accent-label">ACCENT · VOIX SÉLECTIONNÉE</span><span>● = ACCENT · CLIQUER POUR ACTIVER</span></div>
+          <div class="a808-accents" id="a808-accents"></div>
+          <div class="a808-steps" id="a808-steps"></div>
+          <div class="a808-playleds" id="a808-playleds"></div>
+          <div class="a808-stepnumbers" id="a808-numbers"></div>
+          <div class="a808-bottominfo"><span id="a808-message"></span><span>808 ENGINE · PROJET SAUVÉ DANS FL STUDIO</span></div>
+        </div>
+      </section>
+      <div class="a808-footer"><span>FACTORY / USER · PRESETS PROTÉGÉS</span>
+      <span>V1.5.12 · PRESETS 32 PATTERNS · MIDI</span></div>`;
+    const overlay=document.createElement('section');overlay.id='a808-midi-modal';overlay.className='a808-midi-modal';overlay.hidden=true;
+    overlay.innerHTML=`<div class="a808-midi-dialog"><header><strong>MIDI — PIANO ROLL FL STUDIO</strong><button type="button" id="a808-midi-close" aria-label="Fermer">✕</button></header><p id="a808-midi-instructions"></p><div class="a808-midi-rows" id="a808-midi-rows"></div><footer><button type="button" id="a808-midi-copy">COPIER LA LISTE</button></footer></div>`;
+    document.body.append(overlay);
+    document.body.appendChild(shell);
+    const instruments=$('a808-instruments');
+    TRACKS.forEach(([id, label])=>{
+      const tile=document.createElement('div');tile.id='a808-inst-'+id;tile.className='a808-instrument';
+      tile.innerHTML=`<button type="button" class="a808-i-select"><span class="a808-i-title">${label}</span></button><button type="button" class="a808-knob-drawing" id="a808-knob-${id}" aria-label="${label} level"></button><span class="a808-i-caption">${id==='accent'?'STRENGTH':'LEVEL'}</span>`;
+      tile.querySelector('.a808-i-select').onclick=()=>{choice=id;redraw();if(id!=='accent')preview(id);};
+      instruments.append(tile);
+      attachKnob(id,$('a808-knob-'+id));
+    });
+    const banks=$('a808-banks');
+    for(let i=0;i<4;i++){const btn=document.createElement('button');btn.type='button';btn.id='a808-bank-'+i;btn.textContent=BANKS[i];btn.onclick=()=>{bankIndex=i;activatePattern(patternIndex);};banks.append(btn);}
+    const pats=$('a808-patterns');
+    for(let i=0;i<8;i++){const btn=document.createElement('button');btn.id='a808-pat-'+i;btn.textContent=String(i+1);btn.onclick=()=>activatePattern(i);pats.append(btn);}
+    const steps=$('a808-steps'), numbers=$('a808-numbers'), leds=$('a808-playleds'), accents=$('a808-accents');
+    for(let i=0;i<16;i++){
+      const btn=document.createElement('button');btn.type='button';btn.id='a808-step-'+i;btn.dataset.step=String(i);btn.onclick=()=>toggleStep(i);
+      steps.append(btn);
+      const abtn=document.createElement('button');abtn.type='button';abtn.id='a808-accent-'+i;abtn.className='a808-accent-pad';
+      abtn.title='Accent '+(i+1);abtn.setAttribute('aria-label','Accent step '+(i+1));
+      abtn.onclick=()=>toggleAccent(i);accents.append(abtn);
+      const led=document.createElement('span');led.id='a808-playled-'+i;led.className='a808-playled';led.setAttribute('aria-label','Step '+(i+1));leds.append(led);
+      const num=document.createElement('span');num.textContent=String(i+1);numbers.append(num);
+    }
+    $('a808-play').onclick=()=>$('playBtn')?.click();
+    $('a808-stop').onclick=()=>$('stopBtn')?.click();
+    $('a808-length').value=String(currentSteps());
+    $('a808-length').onchange=e=>setStepCount(Number(e.target.value));
+    $('a808-preset-name').addEventListener('change',syncAcidSessionImmediately);
+    $('a808-save-preset').onclick=savePreset;
+    $('a808-load-preset').onclick=choosePresetFromFile;
+    $('a808-prev-preset').onclick=()=>nextPreset(-1);
+    $('a808-next-preset').onclick=()=>nextPreset(1);
+    $('a808-folder-preset').onclick=()=>hostBridge.send('acid808PresetFolder',{});
+    $('a808-update').onclick=updateClick;
+    $('a808-midi-help').onclick=showMidiMap;
+    $('a808-import').onclick=()=>$('a808-midi-file').click();
+    $('a808-midi-file').onchange=async e=>{const f=e.target.files?.[0];if(f)await importMidi(f);e.target.value='';};
+    $('a808-export').onclick=exportMidi;
+    $('a808-midi-close').onclick=hideMidiMap;
+    $('a808-midi-modal').addEventListener('click', e=>{if(e.target===$('a808-midi-modal'))hideMidiMap();});
+    $('a808-midi-copy').onclick=copyMidiMap;
+    $('a808-copy').onclick=copyPattern;
+    $('a808-paste').onclick=pastePattern;
+    $('a808-clear').onclick=clearPattern;
+    $('a808-random').onclick=randomize;
+    $('a808-swing').onchange=()=>{
+      const next=Number($('a808-swing').value);
+      // Swing changes the timing of off-beat steps, not just the visual grid.
+      modifyCurrent('Acid 808: shuffle', b=>{
+        for(const [id] of TRACKS) {
+          if(id==='accent')continue;
+          const notes=(b.data[actualId(id)]||[]);
+          for(const note of notes) {const s=noteStep(note);note.beat=s/4+(s%2?next*.25/100:0);}
+        }
+      });
+      swing=next;
+      $('a808-swing-value').textContent=String(next)+'%';
+    };
+    for(const code of ['fr','en']) $('a808-'+code).onclick=()=>{
+      document.documentElement.setAttribute('data-acid-lang',code);
+      toast(code==='fr'?'Langue : français':'Language: English');
+      const hint=document.querySelector('.a808-hint'); if(hint)hint.textContent=phrase('Choisir une voix, puis activer les pas','Choose a voice, then toggle steps');
+      updateLocale();
+      redraw();
+    };
+    document.documentElement.setAttribute('data-acid-lang','fr');
+    updateLocale();
+  }
+  // V1.3.1: Keep BOTH native positions. The preview scheduler and host scheduler
+  // report in the same idle tick. A stopped host must not extinguish a running
+  // local-preview LED (the bug observed in V1.3).
+  const playPositions={song:{playing:false,beat:0},preview:{playing:false,beat:0}};
+  function updatePlayhead(data,origin) {
+    if(!shell || !data || !playPositions[origin])return;
+    playPositions[origin]={playing:!!data.playing,beat:Number(data.beat)};
+    const song=playPositions.song, preview=playPositions.preview;
+    const position=(song.playing && Number.isFinite(song.beat))?song:
+                   (preview.playing && Number.isFinite(preview.beat))?preview:null;
+    // Display exactly the same loop length as the audio transport.
+    const cycle=currentSteps();
+    const step=position?((Math.floor(position.beat*4+1e-5)%cycle)+cycle)%cycle:-1;
+    for(let i=0;i<16;i++) {
+      const led=$('a808-playled-'+i);
+      if(led)led.classList.toggle('playing',i===step);
+    }
+  }
+  // Per-voice compressor: each of 11 instruments has 3 host-automatable bands.
+  // The audio is compressed before it enters the original channel mixer.
+  const VOICES=TRACKS.filter(([id])=>id!=='accent').map(([id])=>id);
+  const compValues=Object.fromEntries(VOICES.map(id=>[id,[0,0,0]]));
+  function renderComp(parent) {
+    if(choice==='accent')return; // Accent itself does not generate audio.
+    const voice=choice;
+    const values=compValues[voice];
+    const region=document.createElement('section');region.className='a808-comp';
+    const label=document.createElement('div');label.className='a808-comp-title';
+    const voiceName=TRACKS.find(([id])=>id===voice)?.[1]||voice;
+    label.textContent=phrase('COMPRESSEUR 3 BANDES · ','3-BAND COMPRESSOR · ')+voiceName;
+    region.append(label);
+    const tags=[['GRAVES','LOW'],['MÉDIUMS','MID'],['AIGUS','HIGH']];
+    tags.forEach((names,i)=>{
+      const box=document.createElement('label');box.className='a808-comp-band';
+      const title=document.createElement('span');title.textContent=lang()==='en'?names[1]:names[0];
+      const range=document.createElement('input');range.type='range';range.min=0;range.max=100;range.step=1;
+      range.value=values[i];range.className='a808-comp-input';
+      range.dataset.acidCompBand=String(i);
+      const out=document.createElement('output');out.textContent=values[i]+'%';
+      const send=()=>hostBridge.send('acid808Compressor',{voice,band:i,value:values[i]});
+      range.oninput=()=>{values[i]=Number(range.value);out.textContent=range.value+'%';send();};
+      range.onchange=send;
+      range.addEventListener('contextmenu',e=>{
+        e.preventDefault();e.stopPropagation();
+        openControlMenu(e,{name:voiceName+' · Comp '+names[1],min:0,max:100,step:1,defaultValue:0,
+          get:()=>values[i],set:v=>{values[i]=Number(v);range.value=String(values[i]);out.textContent=values[i]+'%';send();},
+          kind:'compressor',voiceIndex:SOUND_IDS.indexOf(voice),band:i});
+      });
+      box.append(title,range,out);region.append(box);
+    });
+    parent.append(region);
+  }
+  // Refresh slider thumbs/readouts when values arrive FROM the VST3 host.
+  // Deliberately do not trigger 'input'/'change' (which would write them back to
+  // FL Studio) and do not rebuild the panel while automation is running.
+  function refreshAutomatedDetailControls() {
+    if(activeSliderGesture || choice==='accent')return;
+    const panel=$('a808-voice');
+    const meta=row(choice);
+    if(!panel || !meta)return;
+    function updateRange(input,value,decimals) {
+      if(!input || !Number.isFinite(Number(value)))return;
+      const num=Number(value);
+      if(Math.abs(Number(input.value)-num)>0.00001)input.value=String(num);
+      const out=input.parentElement?.querySelector('output');
+      if(out)out.textContent=decimals===0?Math.round(num)+'%':num.toFixed(decimals);
+    }
+    panel.querySelectorAll('input[data-acid-param]').forEach(input=>{
+      const c=(meta.controls||[]).find(c=>c.key===input.dataset.acidParam);
+      if(c)updateRange(input,voiceParameter(meta,c),2);
+    });
+    updateRange(panel.querySelector('input[data-acid-decay]'),virtualDecay.get(choice),2);
+    panel.querySelectorAll('input[data-acid-comp-band]').forEach(input=>{
+      const band=Number(input.dataset.acidCompBand);
+      updateRange(input,compValues[choice]?.[band],0);
+    });
+  }
+  // V1.5.9: Real host context menu for exported VST3 parameters. A DOM menu
+  // by itself cannot make FL Studio create automation clips.
+  function openControlMenu(event,control) {
+    document.getElementById('a808-context-actions')?.remove();
+    if(!document.getElementById('a808-context-style')) {
+      const css=document.createElement('style');css.id='a808-context-style';
+      css.textContent=`#a808-context-actions{position:fixed;z-index:2147483000;min-width:238px;max-width:335px;padding:7px;background:#172321;border:1px solid #6b9789;border-radius:7px;box-shadow:0 9px 24px #000b;color:#e0efe6;font:12px Arial,sans-serif}#a808-context-actions .a808-ct-title{font-weight:700;padding:8px 10px;color:#93e5b9;border-bottom:1px solid #516a60}#a808-context-actions button{display:block;width:100%;text-align:left;color:#eaf5ee;background:transparent;border:0;border-radius:4px;padding:9px 10px;cursor:pointer;font:12px Arial,sans-serif}#a808-context-actions button:hover,#a808-context-actions button:focus{background:#345a4d}#a808-context-actions button:disabled{opacity:.4;cursor:default}#a808-context-actions .a808-ct-note{color:#b6c4c0;font-size:11px;padding:9px 10px;line-height:1.35;border-top:1px solid #455a51}`;
+      document.head.append(css);
+    }
+    const menu=document.createElement('div');menu.id='a808-context-actions';menu.setAttribute('role','menu');
+    const title=document.createElement('div');title.className='a808-ct-title';title.textContent=control.name;menu.append(title);
+    let onDown=null, onKey=null;
+    const dismiss=()=>{menu.remove();if(onDown)document.removeEventListener('pointerdown',onDown);if(onKey)document.removeEventListener('keydown',onKey);};
+    const add=(fr,en,fn,disabled=false)=>{
+      const button=document.createElement('button');button.type='button';button.setAttribute('role','menuitem');
+      button.textContent=phrase(fr,en);button.disabled=disabled;
+      button.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();dismiss();fn();});
+      menu.append(button);return button;
+    };
+    const apply=v=>{
+      const n=Number(v);if(!Number.isFinite(n))return;
+      const min=Number(control.min),max=Number(control.max),step=Number(control.step)||0.01;
+      const quantized=min+Math.round((Math.max(min,Math.min(max,n))-min)/step)*step;
+      control.set(Math.max(min,Math.min(max,quantized)));
+    };
+    const validNative=(control.kind==='accent') ||
+      (((control.kind==='compressor' && Number.isInteger(control.band)) || control.kind==='decay' ||
+        (control.kind==='voice' && typeof control.paramKey==='string' && control.paramKey!=='articulationLevel')) &&
+        Number.isInteger(control.voiceIndex) && control.voiceIndex>=0 && control.voiceIndex<11);
+    if(validNative){
+      add('Menu FL Studio : automation / MIDI','FL Studio menu: automation / MIDI',()=>{
+        if(typeof hostBridge!=='undefined' && hostBridge.isEmbedded && hostBridge.send){
+          hostBridge.send('acid808HostParamMenu',{
+            kind:control.kind,voiceIndex:control.voiceIndex,band:control.band??-1,paramKey:control.paramKey??'', 
+            x:Math.max(0,Math.round(event.clientX*(window.devicePixelRatio||1))),
+            y:Math.max(0,Math.round(event.clientY*(window.devicePixelRatio||1)))
+          });
+        }else {
+          toast(phrase('Menu hôte disponible seulement dans le VST3.','Host menu available only in VST3.'));
+        }
+      });
+    }
+    add('Réinitialiser','Reset to default',()=>apply(control.defaultValue));
+    add('Copier la valeur','Copy value',()=>{copiedControlValue=Number(control.get());});
+    add('Coller la valeur','Paste value',()=>apply(copiedControlValue),copiedControlValue===null);
+    add('Entrer une valeur...','Enter value...',()=>{
+      const raw=window.prompt(phrase('Valeur de ','Value for ')+control.name+' ('+control.min+'–'+control.max+')',String(control.get()));
+      if(raw!==null){const n=Number(raw.trim().replace(',','.'));if(Number.isFinite(n))apply(n);}
+    });
+    const note=document.createElement('div');note.className='a808-ct-note';
+    note.textContent=validNative
+      ?phrase('Le menu FL Studio apparaît uniquement si l’hôte prend en charge cette fonction.','The FL Studio menu appears only when supported by the host.')
+      :phrase('Ce réglage n’est pas exposé en automatisation VST3.','This control is not exposed for VST3 automation.');
+    menu.append(note);
+    document.body.append(menu);
+    menu.style.left=Math.max(6,Math.min(event.clientX,innerWidth-menu.offsetWidth-8))+'px';
+    menu.style.top=Math.max(6,Math.min(event.clientY,innerHeight-menu.offsetHeight-8))+'px';
+    onDown=e=>{if(!menu.contains(e.target))dismiss();};
+    onKey=e=>{if(e.key==='Escape')dismiss();};
+    setTimeout(()=>{document.addEventListener('pointerdown',onDown);document.addEventListener('keydown',onKey);},0);
+  }
+
+  // Presets are saved by the C++ host to the user's Documents/AcidDrum808/presets.
+  // The snapshot contains ALL 32 banks/patterns, not only the selected pattern.
+  function presetSnapshot(){
+    return {
+      format:'AcidDrum808Preset',version:1,
+      selected:{bank:bankIndex,pattern:patternIndex,instrument:choice},
+      swing,
+      patterns:Array.from({length:32},(_,k)=>{
+        const bank=Math.floor(k/8),index=k%8,b=findBlock(patternId(bank,index));
+        const tracks={};
+        if(b)TRACKS.forEach(([id])=>{tracks[actualId(id)]=JSON.parse(JSON.stringify(b.data[actualId(id)]||[]));});
+        return {bank,index,steps:stepCounts.get(patternId(bank,index))||16,tracks};
+      }),
+      // The C++ side appends the current true engine/mixer/parameter state.
+      virtualDecay:VOICES.map(id=>virtualDecay.get(id)??100),
+      compressors:VOICES.map(id=>(compValues[id]||[0,0,0]).slice()),
+      language:lang()
+    };
+  }
+  function savePreset(){
+    // The native Windows Save As dialog decides the filename and location.
+    // Never report success until C++ verifies the file has been written.
+    if(!stepCountsReady){toast(phrase('Attendre le chargement des 32 patterns','Wait for all 32 patterns to load'));return;}
+    for(let k=0;k<32;k++)if(!findBlock(patternId(Math.floor(k/8),k%8))){
+      toast(phrase('Banque incomplete : sauvegarde annulee','Incomplete bank: save cancelled'));return;
+    }
+    if(typeof hostBridge==='undefined'||!hostBridge.isEmbedded){
+      toast(phrase('La sauvegarde necessite le plugin VST3 dans FL Studio','Saving requires the VST3 plugin in FL Studio'));return;
+    }
+    hostBridge.send('acid808PresetSave',{name:$('a808-preset-name').value.trim(),preset:presetSnapshot()});
+  }
+  function requestPresets(){hostBridge.send('acid808PresetList',{});}
+  function loadPreset(item){
+    if(!item || !item.id){toast(phrase('Aucun preset sélectionné','No preset selected'));return;}
+    // IDs include the folder, since Factory and User may use the same filename.
+    hostBridge.send('acid808PresetLoad',{id:item.id});
+  }
+  function choosePresetFromFile(){
+    // A real Windows Open dialog; the host validates the file and restores all banks.
+    // Opening a file dialog is already an explicit user action: no extra confirmation.
+    hostBridge.send('acid808PresetChoose',{});
+  }
+  function nextPreset(direction){
+    if(!presetItems.length){requestPresets();toast(phrase('Aucun preset enregistré','No presets saved'));return;}
+    // The current folder determines which preset category is navigated.
+    const folder=activePresetFolder || presetItems[0].folder;
+    const sameFolder=presetItems.filter(x=>x.folder===folder);
+    const options=sameFolder.length?sameFolder:presetItems;
+    let idx=options.findIndex(x=>x.id===selectedPresetId);
+    if(idx<0){
+      const current=$('a808-preset-name').value.trim();
+      idx=options.findIndex(x=>x.name.toLowerCase()===current.toLowerCase());
+    }
+    idx=idx<0?(direction>0?0:options.length-1):(idx+direction+options.length)%options.length;
+    const chosen=options[idx];
+    selectedPresetId=chosen.id; // Advance immediately when arrows are clicked quickly.
+    activePresetFolder=chosen.folder;
+    $('a808-preset-name').value=chosen.name;
+    loadPreset(chosen);
+  }
+  function acceptLoadedPreset(msg){
+    const p=msg?.preset;
+    if(p?.format!=='AcidDrum808Preset'||!Array.isArray(p.patterns)||p.patterns.length!==32) {
+      toast(phrase('Preset incompatible ou incomplet','Preset invalid or incomplete'));return;
+    }
+    // Validate EVERY bank before altering a working project.
+    const compiled=[];
+    for(let k=0;k<32;k++){
+      const src=p.patterns.find(x=>x.bank===Math.floor(k/8)&&x.index===k%8);
+      if(!src||!src.tracks||typeof src.tracks!=='object'||!Number.isFinite(Number(src.steps))) {
+        toast(phrase('Preset incomplet : aucun changement','Incomplete preset: nothing changed'));return;
+      }
+      const tracks={};
+      for(const [id] of TRACKS){
+        const key=actualId(id),notes=src.tracks[key];
+        if(!Array.isArray(notes)||notes.length>128){toast('Preset invalide : '+key);return;}
+        tracks[key]=notes.map(n=>({beat:Number(n.beat),vel:Number(n.vel)}));
+        if(tracks[key].some(n=>!Number.isFinite(n.beat)||n.beat<0||n.beat>=4||!Number.isFinite(n.vel)||n.vel<1||n.vel>127)) {toast('Note MIDI invalide');return;}
+      }
+      compiled.push({tracks,steps:safeStepCount(src.steps)});
+    }
+    const old={bank:bankIndex,pattern:patternIndex};
+    for(let k=0;k<32;k++){
+      const bank=Math.floor(k/8),index=k%8,b=findBlock(patternId(bank,index));
+      if(!b)continue;
+      for(const [id] of TRACKS)b.data[actualId(id)]=compiled[k].tracks[actualId(id)];
+      b.generated=false;b.acid808Steps=compiled[k].steps;
+      stepCounts.set(patternId(bank,index),compiled[k].steps);
+    }
+    if(Array.isArray(p.virtualDecay))VOICES.forEach((id,i)=>virtualDecay.set(id,safePercent(p.virtualDecay[i],100)));
+    if(Array.isArray(p.compressors))VOICES.forEach((id,i)=>{
+      if(Array.isArray(p.compressors[i]))compValues[id]=p.compressors[i].slice(0,3).map(x=>safePercent(x,0));
+    });
+    swing=Math.max(0,Math.min(45,Number(p.swing)||0));
+    $('a808-swing').value=String(swing);$('a808-swing-value').textContent=swing+'%';
+    bankIndex=clamp(Number(p.selected?.bank)||0,0,3);
+    choice=SOUND_IDS.includes(p.selected?.instrument)?p.selected.instrument:'kick';
+    activatePattern(clamp(Number(p.selected?.pattern)||0,0,7));
+    // Push updated patterns to the host-side sequencer, even if the editor later closes.
+    lastPublishedPatterns='';publishPatterns();
+    publishVoiceMapping();
+    if(typeof syncProjectStateToHost==='function')syncProjectStateToHost();
+    // The original app persists project-state edits to the FLP; mimic a native edit.
+    if(typeof rebuildFullFromEditedBlocks==='function')rebuildFullFromEditedBlocks();
+    selectedPreset=msg?.name||p.name||'';
+    selectedPresetId=typeof msg?.id==='string'?msg.id:'';
+    if(typeof msg?.folder==='string')activePresetFolder=msg.folder;
+    $('a808-preset-name').value=selectedPreset;
+    // Cache selection + all 32 updated blocks synchronously for the host.
+    syncAcidSessionImmediately();
+    requestPresets();
+    toast(phrase('Preset chargé : ','Preset loaded: ')+selectedPreset);
+  }
+  function safePercent(x,fallback){const v=Number(x);return Number.isFinite(v)?clamp(v,0,100):fallback;}
+  function refreshPresetNames(payload){
+    // Still accepts an older flat list if a plugin has not been recompiled yet.
+    const entries=Array.isArray(payload?.items)?payload.items:
+      (Array.isArray(payload?.names)?payload.names.map(name=>({id:name+'.aciddrum808preset',name,folder:''})):[]);
+    presetItems=entries.filter(x=>x&&typeof x.id==='string'&&typeof x.name==='string'&&typeof x.folder==='string');
+    if(!selectedPresetId && typeof payload?.activeFolder==='string')activePresetFolder=payload.activeFolder;
+    const status=$('a808-preset-status');
+    if(status){
+      const selected=presetItems.filter(x=>x.folder===activePresetFolder);
+      const count=selected.length?selected.length:presetItems.length;
+      const name=selected.length?activePresetFolder.split('/').pop():'';
+      status.textContent=(name?name+' · ':'')+count+' PRESETS';
+      status.title=activePresetFolder||phrase('Tous les presets','All presets');
+    }
+  }
+
+  // V1.5.12: Persist the chosen preset and active editor selection PER INSTANCE
+  // inside the FL Studio .flp. Do not depend on files in Factory/User at recall.
+  // The full 32-pattern song data is separately embedded by serializeProject().
+  let pendingSessionRestore = undefined; // undefined=no recall; null=legacy recall
+  const cleanText = (v,max=256) => typeof v === 'string' ? v.slice(0,max) : '';
+  function captureAcidSession(){
+    const input=$('a808-preset-name');
+    return {
+      formatVersion:1,
+      presetName:cleanText(input ? input.value : selectedPreset,80),
+      presetId:cleanText(selectedPresetId,2048),
+      presetFolder:cleanText(activePresetFolder,1024),
+      bank:bankIndex, pattern:patternIndex, instrument:choice,
+      swing:swing,
+      stepCounts:Array.from({length:32},(_,k)=>{
+        const key=patternId(Math.floor(k/8),k%8);
+        return safeStepCount(stepCounts.get(key) || findBlock(key)?.acid808Steps || 16);
+      }),
+      virtualDecay:VOICES.map(id=>safePercent(virtualDecay.get(id),100)),
+      compressors:VOICES.map(id=>(compValues[id]||[0,0,0]).slice(0,3))
+    };
+  }
+  function restoreAcidSession(data){
+    if(!shell){pendingSessionRestore=data;return;}
+    // Legacy FLP saved before 1.5.12: pattern audio still comes from its
+    // embedded blocks; the file name was never part of those old states.
+    if(!data || typeof data!=='object' || Number(data.formatVersion)!==1){
+      selectedPreset='';selectedPresetId='';activePresetFolder='';
+      const fld=$('a808-preset-name');if(fld)fld.value='';
+      const current=/^(?:acid808_pattern_([0-7])|acid808_([BCD])_pattern_([0-7]))$/.exec(activeBlockId||'');
+      if(current){bankIndex=current[2]?BANKS.indexOf(current[2]):0;patternIndex=Number(current[2]?current[3]:current[1]);}
+      redraw();return;
+    }
+    selectedPreset=cleanText(data.presetName,80);
+    selectedPresetId=cleanText(data.presetId,2048);
+    activePresetFolder=cleanText(data.presetFolder,1024);
+    const input=$('a808-preset-name');if(input)input.value=selectedPreset;
+    if(Array.isArray(data.stepCounts) && data.stepCounts.length===32){
+      data.stepCounts.forEach((length,k)=>{
+        const id=patternId(Math.floor(k/8),k%8), steps=safeStepCount(length);
+        stepCounts.set(id,steps);
+        const block=findBlock(id);if(block)block.acid808Steps=steps;
+      });
+    }
+    if(Array.isArray(data.virtualDecay) && data.virtualDecay.length===VOICES.length)
+      VOICES.forEach((id,i)=>virtualDecay.set(id,safePercent(data.virtualDecay[i],100)));
+    if(Array.isArray(data.compressors) && data.compressors.length===VOICES.length)
+      VOICES.forEach((id,i)=>{
+        if(Array.isArray(data.compressors[i]) && data.compressors[i].length===3)
+          compValues[id]=data.compressors[i].map(v=>safePercent(v,0));
+      });
+    swing=clamp(Number.isFinite(Number(data.swing))?Number(data.swing):0,0,45);
+    const shuffle=$('a808-swing'),show=$('a808-swing-value');
+    if(shuffle)shuffle.value=String(swing);
+    if(show)show.textContent=Math.round(swing)+'%';
+    bankIndex=clamp(Number.isInteger(data.bank)?data.bank:0,0,3);
+    patternIndex=clamp(Number.isInteger(data.pattern)?data.pattern:0,0,7);
+    choice=TRACKS.some(([id])=>id===data.instrument)?data.instrument:'kick';
+    // This selects the embedded block, NOT a disk preset, ensuring each FLP
+    // instance comes back exactly to its last selected bank and pattern.
+    activatePattern(patternIndex);
+    redraw();
+  }
+  globalThis.acid808CaptureSession=captureAcidSession;
+  globalThis.acid808RestoreSession=restoreAcidSession;
+  function syncAcidSessionImmediately(){
+    // FL Studio may save the project immediately after a preset was selected;
+    // do not wait for project-io's 1000ms periodic safety net.
+    if(typeof syncStateToHost==='function')syncStateToHost();
+  }
+
+  // MIDI SMF export format 0. MIDI 0..127 is taken from the runtime kit mapping.
+  function vlq(n) {n=Math.max(0,Math.floor(n));const a=[n&127];while(n>>=7)a.unshift(0x80|(n&127));return a;}
+  function be16(n){return [(n>>>8)&255,n&255];}
+  function be32(n){return [(n>>>24)&255,(n>>>16)&255,(n>>>8)&255,n&255];}
+  function buildMidi() {
+    const block=theBlock();if(!block)throw Error('No pattern');
+    const ppq=480,ev=[];
+    TRACKS.forEach(([id])=>{
+      if(id==='accent')return;
+      const note=midiNoteFor(id);if(note===null)return;
+      (block.data[actualId(id)]||[]).filter(n=>noteStep(n)<currentSteps()).forEach(n=>{
+        const t=Math.max(0,Math.round(Number(n.beat)*ppq));
+        const v=clamp(Math.round(Number(n.vel)||100),1,127);
+        ev.push({t,order:1,data:[0x99,note,v]});ev.push({t:t+Math.round(ppq/8),order:0,data:[0x89,note,0]});
+      });
+    });
+    ev.sort((a,b)=>a.t-b.t||a.order-b.order);
+    const chunk=[0,0xFF,0x51,0x03,0x07,0xA1,0x20];let last=0;
+    for(const e of ev){chunk.push(...vlq(e.t-last),...e.data);last=e.t;}
+    chunk.push(...vlq(Math.max(0,currentSteps()*ppq/4-last)),0xFF,0x2F,0x00);
+    return new Uint8Array([77,84,104,100,0,0,0,6,0,0,0,1,...be16(ppq),77,84,114,107,...be32(chunk.length),...chunk]);
+  }
+  function exportMidi(){
+    try {
+      if(hostBridge.isEmbedded){
+        // Prefer DrumGroover's native MIDI exporter and native Windows Save dialog.
+        hostBridge.send('exportBlock',{block:theBlock(),params:{bpm:120,kitName:'Acid Drum 808',genre:'Acid'},
+          grid:{numerator:4,denominator:4,snap:0.25},stamp:'acid808-'+BANKS[bankIndex]+'-'+(patternIndex+1)});
+        toast(phrase('Choisir le nom du fichier MIDI','Choose MIDI file name'));return;
+      }
+      const bytes=buildMidi(),url=URL.createObjectURL(new Blob([bytes],{type:'audio/midi'}));
+      const a=document.createElement('a');a.href=url;a.download='AcidDrum808_'+BANKS[bankIndex]+'_'+(patternIndex+1)+'.mid';
+      document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),10000);
+      toast(phrase('Export MIDI lance','MIDI export started'));
+    }catch(e){alert('Export MIDI : '+e.message);}
+  }
+  // Minimal standards-compliant SMF 0/1 reader with running status, tempo and meta events.
+  async function importMidi(file){
+    try {
+      const d=new DataView(await file.arrayBuffer());let p=0;
+      const req=(s)=>{if(p+s>d.byteLength)throw Error('Fichier MIDI tronque');};
+      const u8=()=>{req(1);return d.getUint8(p++);};
+      const u16=()=>{req(2);const x=d.getUint16(p,false);p+=2;return x;};
+      const u32=()=>{req(4);const x=d.getUint32(p,false);p+=4;return x;};
+      const tag=()=>String.fromCharCode(u8(),u8(),u8(),u8());
+      const skip=n=>{req(n);p+=n;};
+      const rv=()=>{let n=0;for(let i=0;i<4;i++){const b=u8();n=(n<<7)|(b&127);if(!(b&128))return n;}throw Error('VLQ invalide');};
+      if(tag()!=='MThd')throw Error('Ce fichier ne contient pas un en-tete MIDI');
+      const header=u32();if(header<6)throw Error('MIDI header invalide');
+      const format=u16(),tracks=u16(),division=u16();skip(header-6);
+      if(format>1||division&0x8000)throw Error('MIDI format 0/1 avec PPQ requis');
+      const notes=[];
+      for(let k=0;k<tracks;k++) {
+        if(tag()!=='MTrk')throw Error('Piste MIDI invalide');const len=u32(),end=p+len;if(end>d.byteLength)throw Error('Piste MIDI tronquee');
+        let tick=0,status=0;
+        while(p<end){tick+=rv();let b=u8(),data1=null;
+          if(b<128){data1=b;b=status;if(!b)throw Error('Running status MIDI invalide');}
+          else if(b<240)status=b;
+          if(b===0xFF){u8();skip(rv());continue;}
+          if(b===0xF0||b===0xF7){skip(rv());status=0;continue;}
+          const kind=b&0xF0;
+          if(kind>=0x80&&kind<=0xE0){const a=data1===null?u8():data1;const v=(kind===0xC0||kind===0xD0)?0:u8();
+            if(kind===0x90&&v>0)notes.push({tick,note:a,vel:v});
+          }else throw Error('Evenement MIDI non pris en charge');
+        }
+        p=end;
+      }
+      const dict=new Map();TRACKS.forEach(([id])=>{
+        const note=midiNoteFor(id),legacy=oldGmNoteFor(id);
+        if(note!==null&&!dict.has(note))dict.set(note,id);
+        // Preserve imports of MIDI exported by earlier versions (native GM notes).
+        if(legacy!==null&&!dict.has(legacy))dict.set(legacy,id);
+      });
+      const imported={};TRACKS.forEach(([id])=>imported[actualId(id)]=[]);
+      let count=0,ignored=0;
+      for(const e of notes){const id=dict.get(e.note);if(!id){ignored++;continue;}
+        const step=Math.round(e.tick*4/division);if(step<0||step>=currentSteps()){ignored++;continue;}
+        const target=imported[actualId(id)];if(target.some(n=>noteStep(n)===step))continue;
+        target.push({beat:step/4,vel:e.vel});count++;
+      }
+      if(!count){alert(phrase('Aucune note reconnue sur les 16 premiers pas. Verifie les notes du panneau MIDI.','No recognized notes in the first 16 steps. Check MIDI mapping.'));return;}
+      if(!confirm(phrase('Remplacer le pattern actuel par '+count+' notes MIDI ?','Replace current pattern with '+count+' MIDI notes?')))return;
+      modifyCurrent('Acid 808: MIDI import',b=>{TRACKS.forEach(([id])=>b.data[actualId(id)]=imported[actualId(id)]);});
+      toast(count+' notes MIDI importees'+(ignored?' · '+ignored+' ignorees':'') );
+    }catch(e){alert('IMPORT MIDI : '+e.message);}
+  }
+
+  let tries=0;
+  const startup=setInterval(()=>{
+    try {
+      // Wait for the actual VST3 instrument table and initial sequence creation.
+      if(!INSTRUMENT_TABLE || !trackList.length || !blocksList.length || !activeBlockId) {
+        if(++tries>100){clearInterval(startup);console.warn('Acid Drum V1.5.12: native engine not ready');}
+        return;
+      }
+      clearInterval(startup);
+      makeShell();initializePatterns();
+      if(pendingSessionRestore !== undefined){
+        const recalled=pendingSessionRestore;pendingSessionRestore=undefined;
+        restoreAcidSession(recalled);
+      }
+      redraw();
+      publishVoiceMapping();
+      if(typeof hostBridge !== 'undefined' && hostBridge.on) {
+        hostBridge.on('voiceParamState',()=>{if(activeSliderGesture)return;knobValues.clear();redraw();});
+        // Secondary real-time path from iPlug2 native SPVFD callback.
+        // kAcidLegacyParamCount has value 47; index 47 itself is NOT a knob.
+        // The 30 actual controls run from 48..77. Existing IDs remain stable.
+        hostBridge.on('acid808HostParamValue',p=>{
+          const idx=Number(p?.index), raw=Number(p?.normalized);
+          if(!Number.isInteger(idx) || !Number.isFinite(raw))return;
+          const n=clamp(raw,0,1);
+          function cacheParam(id,key,value){
+            const meta=row(id);
+            if(meta && typeof deVoiceParamStateCache!=='undefined' && deVoiceParamStateCache){
+              const address=meta.family+':'+meta.paramIndex;
+              (deVoiceParamStateCache[address] ||= {})[key]=value;
+            }
+          }
+          if(idx>=48 && idx<=58){
+            const id=SOUND_IDS[idx-48];
+            if(!id)return;
+            const spec=knobSpec(id);
+            if(spec)cacheParam(id,spec.key,n);
+            if(!activeSliderGesture){knobValues.set(id,n);drawKnob(id);}
+          }else if(idx>=59 && idx<=69){
+            const id=SOUND_IDS[idx-59];if(id)cacheParam(id,'pitchRatio',0.67+0.83*n);
+          }else if(idx>=70 && idx<=76){
+            const extras=[['kick','toneKnob'],['snare','toneKnob'],['tomLow','tuningKnob'],
+              ['tomMid','tuningKnob'],['tomHi','tuningKnob'],['crash1','toneKnob'],['snare','snappyKnob']];
+            const entry=extras[idx-70];if(entry)cacheParam(entry[0],entry[1],n);
+          }else if(idx===77){
+            const percent=100*n;
+            const accent=$('deAccentAmount');
+            if(accent)accent.value=String(percent);
+            const text=$('deAccentAmountVal');if(text)text.textContent=Math.round(percent)+'%';
+            if(!activeSliderGesture){knobValues.set('accent',percent);drawKnob('accent');}
+          }else if(idx>=6 && idx<=16){
+            const id=SOUND_IDS[idx-6];if(id)virtualDecay.set(id,n*100);
+          }else{
+            // Indices 3..5 are Kick compressor; 17..46 are the other 10 voices.
+            let voice=-1,band=-1;
+            if(idx>=3 && idx<=5){voice=0;band=idx-3;}
+            else if(idx>=17 && idx<=46){voice=1+Math.floor((idx-17)/3);band=(idx-17)%3;}
+            if(voice>=0 && voice<SOUND_IDS.length){
+              const id=SOUND_IDS[voice];compValues[id][band]=n*100;
+            }
+          }
+          refreshAutomatedDetailControls();
+        });
+        hostBridge.on('acid808AutomationSnapshot',p=>{
+          if(!Array.isArray(p?.values) || p.values.length!==30)return;
+          // 11 Level + 11 Pitch + 7 Tone/Tuning/Snappy + 1 Accent.
+          SOUND_IDS.forEach((id,i)=>{
+            const level=Number(p.values[i]);
+            const meta=row(id);
+            if(meta && typeof deVoiceParamStateCache!=='undefined' && deVoiceParamStateCache){
+              const addr=meta.family+':'+meta.paramIndex;
+              const state=deVoiceParamStateCache[addr] ||= {};
+              const c=(meta.controls||[]).find(c=>['level','levelKnob','volume','volumeKnob'].includes(c.key));
+              if(c && Number.isFinite(level))state[c.key]=level;
+              const pitch=Number(p.values[11+i]);
+              if(Number.isFinite(pitch))state.pitchRatio=pitch;
+              const toneSlot={kick:22,snare:23,tomLow:24,tomMid:25,tomHi:26,crash1:27};
+              const toneKey=id.startsWith('tom')?'tuningKnob':'toneKnob';
+              if(toneSlot[id]!==undefined){
+                const tone=Number(p.values[toneSlot[id]]);
+                if(Number.isFinite(tone))state[toneKey]=tone;
+              }
+              if(id==='snare' && Number.isFinite(Number(p.values[28])))
+                state.snappyKnob=Number(p.values[28]);
+            }
+            // The original v1.5.9 redrew ONLY the selected voice here.
+            // Refresh every rotary to mirror automation on any channel.
+            if(!activeSliderGesture && Number.isFinite(level)){
+              knobValues.set(id,level);
+              drawKnob(id);
+            }
+          });
+          const accent=$('deAccentAmount');
+          const percent=Number(p.values[29]);
+          if(Number.isFinite(percent)){
+            if(accent && Number(accent.value)!==percent){
+              accent.value=String(percent);
+              const val=$('deAccentAmountVal');if(val)val.textContent=Math.round(percent)+'%';
+              if(typeof dggAccentAmount!=='undefined')dggAccentAmount=percent/100;
+              if(typeof neRefreshAccentReadout==='function')neRefreshAccentReadout();
+            }
+            if(!activeSliderGesture){knobValues.set('accent',percent);drawKnob('accent');}
+          }
+          if(Array.isArray(p.decays) && p.decays.length===11)
+            SOUND_IDS.forEach((id,i)=>{
+              const v=Number(p.decays[i]);if(Number.isFinite(v))virtualDecay.set(id,v);
+            });
+          if(Array.isArray(p.compressors) && p.compressors.length===11)
+            SOUND_IDS.forEach((id,i)=>{
+              if(!Array.isArray(p.compressors[i]) || p.compressors[i].length!==3)return;
+              const values=p.compressors[i].map(v=>Number(v));
+              if(values.every(Number.isFinite))compValues[id]=values;
+            });
+          refreshAutomatedDetailControls();
+        });
+        hostBridge.on('articulationLevelState',()=>{if(activeSliderGesture)return;knobValues.clear();redraw();});
+        hostBridge.on('songPosition',p=>updatePlayhead(p,'song'));
+        hostBridge.on('previewPosition',p=>updatePlayhead(p,'preview'));
+        hostBridge.on('acid808PresetList',refreshPresetNames);
+        hostBridge.on('acid808PresetSaved',p=>{
+          selectedPreset=p?.name||'';
+          selectedPresetId=typeof p?.id==='string'?p.id:'';
+          if(typeof p?.folder==='string')activePresetFolder=p.folder;
+          $('a808-preset-name').value=selectedPreset;
+          syncAcidSessionImmediately();
+          const suffix=p?.inPresetFolder===false ? phrase(' (dossier externe)',' (external folder)') : '';
+          toast(phrase('Preset enregistré sur disque : ','Preset saved to disk: ')+selectedPreset+suffix);
+          requestPresets();
+        });
+        hostBridge.on('acid808PresetLoaded',acceptLoadedPreset);
+        hostBridge.on('acid808PresetError',p=>toast((p?.message)||'Erreur preset'));
+        hostBridge.on('acid808StepsState',p=>{
+          if(!Array.isArray(p?.steps)||p.steps.length!==32)return;
+          p.steps.forEach((n,k)=>{
+            const b=Math.floor(k/8),idx=k%8;
+            const id=patternId(b,idx);
+            stepCounts.set(id,safeStepCount(n));
+            const block=findBlock(id);if(block)block.acid808Steps=safeStepCount(n);
+          });
+          stepCountsReady=true;
+          applyPatternLoop();
+          redraw();
+        });
+        requestPresets();
+        checkForUpdates();
+        hostBridge.send('acid808StepsQuery',{});
+        hostBridge.on('acid808MidiPattern',p=>{
+          const k=Number(p?.index);
+          if(Number.isInteger(k)&&k>=0&&k<32){
+            const nextBank=Math.floor(k/8),nextIndex=k%8;
+            if(bankIndex!==nextBank||patternIndex!==nextIndex){bankIndex=nextBank;activatePattern(nextIndex);}
+          }
+        });
+        hostBridge.on('acid808CompState',p=>{
+          if(Array.isArray(p?.values)){
+            VOICES.forEach((id,i)=>{
+              if(Array.isArray(p.values[i]))compValues[id]=p.values[i].slice(0,3).map(x=>Math.max(0,Math.min(100,Number(x)||0)));
+            });
+            // Re-render only the currently selected voice; no cross-voice updates.
+            if(!activeSliderGesture)instrumentControls(choice);
+          }
+        });
+        hostBridge.on('acid808DecayState',p=>{if(Array.isArray(p?.values)){TRACKS.filter(t=>t[0]!=='accent').forEach(([id],i)=>virtualDecay.set(id,Number(p.values[i])));if(!activeSliderGesture)instrumentControls(choice);}});
+        hostBridge.send('acid808CompressorQuery',{});
+        hostBridge.send('acid808DecayQuery',{});
+      }
+    } catch(e) {clearInterval(startup);console.error('Acid Drum 808 V1.5.12 init:',e);
+      const warning=document.createElement('div');warning.style.cssText='position:fixed;left:15px;bottom:15px;background:#551c1c;color:white;padding:15px;z-index:100000';
+      warning.textContent='Erreur interface Acid Drum 808 V1.5.12 : '+e.message;document.body.append(warning);
+      document.body.classList.add('a808-error');
+    }
+  },200);
+})();

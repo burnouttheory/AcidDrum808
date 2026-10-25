@@ -1,0 +1,124 @@
+/* SPDX-License-Identifier: MIT -- Acid Drum 808 V1.1.1 */
+body > .app { visibility: hidden !important; pointer-events: none !important; }
+body.a808-error > .app { visibility: visible !important; pointer-events: auto !important; }
+#acid808Shell {position:fixed;inset:0;z-index:7000;overflow:auto;color:#f0f0ed;
+  background:linear-gradient(180deg,#303337 0%,#1b2023 56%,#121619 100%);
+  font-family:Segoe UI,Arial,sans-serif;font-size:13px;box-sizing:border-box;padding:16px 18px;
+  display:flex;flex-direction:column;gap:10px;letter-spacing:.035em;}
+#acid808Shell * {box-sizing:border-box;}
+#acid808Shell button {cursor:pointer;font:inherit;font-weight:700;white-space:nowrap;}
+.a808-mainhead {display:flex;justify-content:space-between;gap:20px;align-items:center;min-height:68px;padding:10px 16px;
+  background:linear-gradient(180deg,#1b1d1e,#111516);border:1px solid #53585a;border-radius:6px;box-shadow:0 3px 7px #0507078c;}
+.a808-mainhead>div:first-child {display:flex;flex-direction:column;align-items:flex-start;position:relative;min-width:300px;}
+.a808-brand {font-size:10px;font-weight:700;letter-spacing:.32em;color:#aaaead;}
+.a808-mainhead strong {font-size:25px;font-style:italic;letter-spacing:.03em;line-height:1.23;}
+.a808-mainhead strong em {color:#f58a23;text-shadow:0 0 11px #df66103b;}
+.a808-version {position:absolute;right:0;top:7px;color:#9caca3;font-size:10px;}
+.a808-playback {display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;}
+.a808-playback>button {background:#222a2c;border:1px solid #526364;color:#eee;padding:10px 15px;border-radius:4px;}
+#a808-play {background:#0c5a3c;border-color:#1abe76;color:#b9ffda;}
+#a808-stop {color:#f39d92;}
+.a808-led {width:11px;height:11px;background:#5bff70;box-shadow:0 0 10px #30ff58;border-radius:50%;}
+.a808-sync {font-size:10px;font-weight:700;color:#c7d0c5;margin-right:12px;}
+.a808-instr-title {padding:5px 12px;display:flex;justify-content:space-between;gap:15px;font-size:10px;font-weight:700;color:#cbd2cf;letter-spacing:.18em;}
+.a808-hint {color:#a6b4ab;letter-spacing:0;text-transform:none;}
+.a808-instruments {display:grid;grid-template-columns:repeat(12,minmax(72px,1fr));gap:3px;flex:none;min-height:185px;padding:10px 8px;
+   background:linear-gradient(#222628,#171b1e);border:1px solid #586064;border-radius:6px;}
+.a808-instrument {display:flex;flex-direction:column;align-items:center;justify-content:space-between;text-align:center;
+  color:#d5dcda;background:linear-gradient(#2d3333,#22272a);border:1px solid #424849;border-radius:5px;padding:16px 3px;min-width:0;font-weight:700;}
+.a808-instrument:hover {border-color:#ad9d7b;}
+.a808-instrument.chosen {color:#f9ddaa;border-color:#ffb74b;background:linear-gradient(#40413b,#252920);box-shadow:inset 0 0 13px #ce882d2a;}
+#acid808Shell .a808-i-select {background:transparent;border:0;padding:0 2px;color:inherit;min-height:30px;white-space:normal;}
+#acid808Shell .a808-i-select:hover {color:#fff8df;}
+.a808-i-title {font-size:10px;font-weight:800;letter-spacing:.03em;white-space:normal;min-height:30px;}
+.a808-knob-drawing {width:45px;height:45px;border:4px solid #101718;border-radius:100%;display:block;position:relative;
+  box-shadow:0 1px 1px #777 inset,0 3px 6px #000;touch-action:none;user-select:none;cursor:ns-resize;background:conic-gradient(from 245deg,#111 0deg,#7c7f79 90deg,#121414 96deg,#101111 285deg);}
+.a808-knob-drawing::after {content:'';height:18px;width:3px;background:#ef8a31;position:absolute;left:calc(50% - 1.5px);top:4px;transform:rotate(var(--a808-angle,0deg));transform-origin:center 18px;border-radius:2px;}
+.a808-knob-drawing:focus-visible {outline:2px solid #b9ff79;outline-offset:3px;}
+.a808-i-caption {font-size:8px;color:#c8cac5;white-space:normal;}
+.a808-workbench {display:grid;grid-template-columns:260px minmax(0,1fr);gap:10px;min-height:315px;flex:1;}
+.a808-voice {background:linear-gradient(#1c2423,#141c1b);border:1px solid #3d6555;border-radius:6px;padding:17px;display:flex;flex-direction:column;gap:12px;}
+.a808-voice-heading {font-size:15px;font-weight:800;color:#8bffc5;margin-bottom:9px;}
+.a808-param {display:grid;grid-template-columns:58px 1fr 37px;gap:8px;align-items:center;font-size:11px;font-weight:700;}
+.a808-param output {font:11px Consolas,monospace;color:#e7b45a;text-align:right;}
+.a808-param input {width:100%;accent-color:#e2a73b;cursor:pointer;}
+.a808-smallbtn {background:#26332d;color:#d1e8d8;border:1px solid #60866f;border-radius:4px;padding:7px 13px;}
+.a808-stepzone {background:linear-gradient(#1f2728,#1b2023);border:1px solid #545a58;border-radius:6px;padding:16px 18px;display:flex;flex-direction:column;justify-content:space-between;gap:13px;min-width:0;}
+.a808-controls {display:flex;flex-direction:column;gap:8px;}
+.a808-row {display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.a808-row small {font-size:10px;font-weight:800;letter-spacing:.08em;color:#d2d5c6;margin:0 6px;}
+#a808-patterns {display:flex;gap:3px;}
+#a808-patterns button {width:31px;height:30px;border:1px solid #697471;border-radius:3px;color:#ced4ce;background:#1b2323;}
+#a808-patterns button.chosen {background:#c55b32;color:#fff;border-color:#ffb16b;}
+.a808-actions>button {background:#272d2d;border:1px solid #74817a;border-radius:3px;color:#e0e4da;padding:7px 10px;}
+#a808-random {color:#11190d;background:#b9dc58;border-color:#e5f095;}
+.a808-swing-label {margin-left:12px;color:#d8dcc7;font-size:10px;font-weight:700;}
+#a808-swing {width:80px;accent-color:#fba82e;cursor:pointer;}
+#a808-swing-value {color:#ffb450;font-family:Consolas,monospace;}
+.a808-stepheader {display:flex;justify-content:space-between;color:#d7dfcd;font-size:10px;font-weight:800;letter-spacing:.1em;}
+.a808-steps,.a808-stepnumbers {display:grid;grid-template-columns:repeat(16,minmax(0,1fr));gap:5px;}
+.a808-steps button {height:64px;border-radius:4px 4px 6px 6px;border:1px solid #c3b9aa;background:linear-gradient(145deg,#f9f9ee,#c4c6bf);box-shadow:0 5px 0 #4a4d47;}
+.a808-steps button:nth-child(-n+4) {background:linear-gradient(#f28160,#d74b3b);border-color:#ff9e7b;}
+.a808-steps button:nth-child(n+5):nth-child(-n+8) {background:linear-gradient(#f09c40,#c35b23);border-color:#ffb76c;}
+.a808-steps button:nth-child(n+9):nth-child(-n+12) {background:linear-gradient(#f4d35c,#d6aa34);border-color:#fff1a6;}
+.a808-steps button.on {outline:3px solid #a9ff79;outline-offset:-4px;box-shadow:0 0 18px #aaff5d9c,0 5px 0 #3c6532;filter:brightness(1.2);}
+.a808-stepnumbers {margin-top:-3px;text-align:center;font-size:10px;font-weight:800;color:#cbd2c8;}
+.a808-stepnumbers span:nth-child(4n+1) {color:#ffb772;}
+.a808-bottominfo {display:flex;justify-content:space-between;color:#8baca2;font-size:9px;gap:15px;font-weight:700;}
+.a808-footer {display:flex;justify-content:space-between;color:#7d9489;font-size:9px;padding:0 6px;}
+@media(max-width:1200px){.a808-instruments{overflow-x:auto;grid-template-columns:repeat(12,minmax(80px,1fr));}.a808-workbench{grid-template-columns:205px 1fr;}.a808-stepzone{padding:12px}.a808-steps,.a808-stepnumbers{gap:3px;}}
+@media(max-width:850px){.a808-workbench{grid-template-columns:1fr}.a808-voice{min-height:150px}.a808-instruments{min-height:150px}.a808-stepzone{min-height:270px}}
+
+/* V1.2 — four bank selectors and mapping dialog (unchanged 808 look) */
+#a808-banks{display:flex;gap:3px;}
+#a808-banks button{width:29px;height:30px;border:1px solid #607367;border-radius:3px;background:#26332d;color:#cae2d1;}
+#a808-banks button.chosen{background:#e19b41;color:#17211b;border-color:#ffce79;}
+#a808-midi-help{margin-left:10px;border-color:#68a494;color:#b8f6e5;}
+.a808-voice{overflow-y:auto;}
+.a808-voice .a808-param{grid-template-columns:68px 1fr 37px;gap:5px;}
+.a808-midi-modal{position:fixed;inset:0;z-index:10000;display:flex;justify-content:center;align-items:center;background:#030908d9;color:#e8f6e9;font:12px Segoe UI,Arial,sans-serif;padding:24px;}
+.a808-midi-modal[hidden]{display:none;}
+.a808-midi-dialog{background:#1b2525;border:1px solid #67907a;box-shadow:0 15px 55px #0009;border-radius:9px;width:min(620px,96vw);max-height:92vh;overflow:auto;padding:18px;}
+.a808-midi-dialog header,.a808-midi-dialog footer{display:flex;justify-content:space-between;align-items:center;gap:12px;}
+.a808-midi-dialog header strong{font-size:17px;color:#89ffc8;letter-spacing:.07em;}
+.a808-midi-dialog button{border:1px solid #6b977b;border-radius:4px;padding:8px 12px;color:white;background:#234539;cursor:pointer;}
+.a808-midi-dialog p{line-height:1.5;color:#cad7d0;}
+.a808-midi-rows{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin:14px 0;}
+.a808-midi-item{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px;border:1px solid #374b45;border-radius:4px;background:#121c1a;}
+.a808-midi-item span{color:#f4c475;white-space:nowrap;}
+@media(max-width:600px){.a808-midi-rows{grid-template-columns:1fr;}}
+
+/* V1.3: 808 knob radial calibration marks, light chaser and three-band compressor */
+.a808-knob-drawing{isolation:isolate;overflow:visible;}
+.a808-knob-drawing:before{content:'';position:absolute;z-index:-1;inset:-12px;border-radius:50%;background:repeating-conic-gradient(from 235deg,transparent 0deg 5.8deg,#bab49f 6deg 7.5deg,transparent 7.7deg 20deg);mask:radial-gradient(transparent 52%,black 57% 65%,transparent 69%);pointer-events:none;}
+.a808-knob-drawing:hover:before{background:repeating-conic-gradient(from 235deg,transparent 0deg 5.8deg,#f1c27a 6deg 7.5deg,transparent 7.7deg 20deg);}
+.a808-playleds{display:grid;grid-template-columns:repeat(16,minmax(0,1fr));gap:5px;align-items:center;margin-top:11px;margin-bottom:-5px;}
+.a808-playled{width:10px;height:10px;border-radius:50%;display:block;justify-self:center;border:1px solid #47584b;background:#142420;box-shadow:inset 0 1px 2px #0009;}
+.a808-playled.playing{background:#74ff8c;border-color:#beffc1;box-shadow:0 0 12px #56ff7d,0 0 3px #dbffe4;}
+.a808-comp{border:1px solid #4b7863;border-radius:5px;padding:11px 10px;background:#0d1818;display:flex;flex-direction:column;gap:7px;margin-top:6px;}
+.a808-comp-title{font-size:10px;letter-spacing:.11em;font-weight:900;color:#b4ffc9;}
+.a808-comp-band{display:grid;grid-template-columns:53px minmax(0,1fr) 40px;align-items:center;gap:4px;font-size:10px;}
+.a808-comp-band input{width:100%;accent-color:#9ce67b;cursor:pointer;}
+.a808-comp-band output{color:#c9f5a4;font-family:Consolas,monospace;font-size:10px;text-align:right;}
+.a808-linkmenu{position:fixed;z-index:25000;background:#141f1c;color:#e3f7e9;border:1px solid #72bd86;border-radius:6px;box-shadow:0 8px 35px #000a;width:325px;padding:12px;font:12px/1.5 Segoe UI,Arial,sans-serif;}
+.a808-linkmenu strong{color:#adffbc;display:block;margin-bottom:5px;}
+.a808-linkmenu button{margin-top:10px;background:#1c553c;border:1px solid #62ba80;color:#fff;border-radius:4px;padding:5px 10px;}
+#a808-import,#a808-export{border:1px solid #70a889;color:#d1f0da;background:#243a32;padding:6px 9px;border-radius:4px;font-size:10px;}
+@media(max-width:1200px){.a808-playleds{gap:3px}.a808-comp-band{grid-template-columns:50px 1fr 38px;}}
+
+/* Accent row for the currently selected voice, above the 16 pads */
+.a808-accentbar{display:flex;justify-content:space-between;align-items:center;margin-top:15px;margin-bottom:5px;color:#f0bd68;font:700 10px Segoe UI,Arial,sans-serif;letter-spacing:.6px}
+.a808-accentbar span:last-child{font-weight:500;font-size:9px;color:#a1a9a7}
+.a808-accents{display:grid;grid-template-columns:repeat(16,minmax(0,1fr));gap:5px;padding:0 1px 9px}
+.a808-accent-pad{display:block;min-width:0;height:18px;border-radius:5px;background:#333d3a;border:1px solid #566461;cursor:pointer;position:relative;transition:background .12s ease}
+.a808-accent-pad:after{content:'';display:block;width:7px;height:7px;border-radius:50%;position:absolute;top:4px;left:calc(50% - 3.5px);background:#6b7470;box-shadow:0 0 2px #243532}
+.a808-accent-pad.on{background:#422a16;border-color:#efb04c}
+.a808-accent-pad.on:after{background:#ffad38;box-shadow:0 0 9px #ffbf53}
+.a808-accent-pad.muted{opacity:.3}
+.a808-accent-pad:hover{border-color:#f2c06d}
+.a808-stepheader{margin-top:8px}
+
+/* V1.3.1: active playback LED is strongly visible below each step. */
+.a808-playleds{min-height:18px;overflow:visible;}
+.a808-playled{width:12px;height:12px;background:#263930;border:1px solid #718473;transition:background .06s linear,box-shadow .06s linear;}
+.a808-playled.playing{background:#80ff6c;border-color:#d0ffd0;box-shadow:0 0 14px 4px #55ff6699,0 0 3px white;}

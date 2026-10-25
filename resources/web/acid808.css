@@ -1,0 +1,15 @@
+/* Acid Drum 808 V1.0: visual layer only; upstream DSP unchanged. */
+:root {
+  --cyan: #5ee8bd;
+  --cyan-dim: rgba(94,232,189,.12);
+  --cyan-strong: rgba(94,232,189,.25);
+  --accent: #5ee8bd;
+  --accent-dim: rgba(94,232,189,.12);
+  --accent-strong: rgba(94,232,189,.25);
+  --value: #f3b968;
+  --select: #f3b968;
+}
+body { background-color: #10191c; }
+.compact-toolbar { border-bottom: 1px solid rgba(94,232,189,.28); }
+.btn.primary { border-color: var(--accent); color: var(--accent); }
+.tab-btn.active, .tab-button.active { border-color: var(--accent); color: var(--accent); }
