@@ -1,0 +1,441 @@
+/* SPDX-License-Identifier: MIT
+ * Acid Drum 808 V1.1.1 -- interactive knobs, compact interface adapter to DrumGroover (Reiner Prokein).
+ * The original C++ 808 engine, bridge, host playback and source remain unmodified.
+ * This script is placed AFTER app.js and calls the existing project/engine APIs.
+ */
+(() => {
+  'use strict';
+  const TRACKS = [
+    ['kick',       'BASS DRUM',  'kick'],
+    ['snare',      'SNARE DRUM', 'snare'],
+    ['tomLow',     'LOW TOM',    'tom'],
+    ['tomMid',     'MID TOM',    'tom'],
+    ['tomHi',      'HI TOM',     'tom'],
+    ['snareRimShot','RIM SHOT',  'rim'],
+    ['handClap808','HAND CLAP',  'clap'],
+    ['cowbell808', 'COWBELL',    'bell'],
+    ['crash1',     'CYMBAL',     'cymbal'],
+    ['ohh',        'OPEN HAT',   'hat'],
+    ['chh',        'CLSD HAT',   'hat'],
+    ['accent',     'ACCENT',     'accent'],
+  ];
+  let choice = 'kick';
+  let patternIndex = 0;
+  let clipboard = null;
+  let swing = 0;
+  let shell;
+  const knobValues = new Map(); // immediate visual state between host updates
+  const clamp = (x,a,b) => Math.min(b,Math.max(a,x));
+  const $ = id => document.getElementById(id);
+  const norm = id => id === 'handClap808' || id === 'cowbell808';
+  const theBlock = () => findBlock('acid808_pattern_' + patternIndex);
+  const row = id => INSTRUMENT_TABLE?.instruments?.find(x => x.id === id);
+  const actualId = id => norm(id) ? 'acid808_custom_' + id : id;
+  const group = (id) => id === 'accent' ? 'accent' : (TRACKS.find(t => t[0] === id)?.[2] || 'kick');
+  const lang = () => document.documentElement.getAttribute('data-acid-lang') || 'fr';
+  const phrase = (fr, en) => lang() === 'en' ? en : fr;
+  function noteStep(n) { return Math.round(n.beat * 4); }
+  function beatsForStep(s) { return s / 4 + (s % 2 ? swing * 0.25 / 100 : 0); }
+  function defaultData() {
+    const d = {};
+    trackList.forEach(t => d[t.id] = []);
+    d.accent = [];
+    return d;
+  }
+  function initializePatterns() {
+    const required = ['handClap808', 'cowbell808'];
+    // Custom voices are available in the native engine but need a track to schedule notes.
+    for (const id of required) {
+      if (trackList.some(t => t.customInstrument === id)) continue;
+      const meta = row(id);
+      if (!meta) throw Error('Instrument de percussion absent : ' + id);
+      const next = findUnusedGmNote();
+      trackList.push({ id: actualId(id), label: meta.name, role: 'custom',
+        customInstrument: id, color: DGInstrument.trackHex('custom', 0, 1), gm: next });
+      blocksList.forEach(b => { if (b.data) b.data[actualId(id)] ||= []; });
+    }
+    for (let i = 0; i < 8; i++) {
+      const id = 'acid808_pattern_' + i;
+      if (findBlock(id)) continue;
+      const data = defaultData();
+      if (i === 0) {
+        for (const s of [0, 4, 8, 12]) data.kick.push({beat: s/4, vel: 110});
+        for (const s of [4, 12]) data.snare.push({beat:s/4, vel:105});
+        for (let s = 0; s < 16; s += 2) data.chh.push({beat:s/4, vel:79});
+        data.accent.push({beat:0, vel: 120}, {beat:2, vel: 120});
+      }
+      blocksList.push({id, name:'Pattern ' + (i+1), generated:false,
+        numerator:4, length:1, turnaroundInterval:0, velocityBuild:0,
+        lockedGroups:{}, data});
+    }
+    if (!/^acid808_pattern_[0-7]$/.test(activeBlockId || '')) patternIndex = 0;
+    else patternIndex = Number(activeBlockId.slice(-1));
+    syncCustomInstruments();
+    // Fixed 808 engine, regardless of the last-used DrumGroover engine.
+    if ($('deEngineSelect') && $('deEngineSelect').value !== 'internal') {
+      $('deEngineSelect').value = 'internal';
+      $('deEngineSelect').dispatchEvent(new Event('change', {bubbles:true}));
+    }
+    // The native host scheduler uses this sequence, even though the Song Generator UI is hidden.
+    activatePattern(patternIndex);
+  }
+  function activatePattern(i) {
+    patternIndex = i;
+    activeBlockId = 'acid808_pattern_' + i;
+    songEngine.songSequence = [{blockId:activeBlockId,startBar:0,loopCount:1}];
+    if (typeof tlLoopStart !== 'undefined') tlLoopStart = 0;
+    if (typeof tlLoopEnd !== 'undefined') tlLoopEnd = 4; // native timeline loop uses beats, not bars
+    if ($('subdivision')) $('subdivision').value = '4';
+    if ($('numerator')) $('numerator').value = '4';
+    if ($('denominator')) $('denominator').value = '4';
+    renderBlockTabs();
+    renderNoteEditor();
+    rebuildFullFromEditedBlocks();
+    redraw();
+  }
+  function toggleStep(step) {
+    const block = theBlock();
+    if (!block) return;
+    const id = actualId(choice);
+    withBlockDataUndo('Acid 808: step ' + (step + 1), block, () => {
+      const arr = (block.data[id] ||= []);
+      const k = arr.findIndex(n => noteStep(n) === step);
+      if (k >= 0) arr.splice(k, 1);
+      else arr.push({beat:beatsForStep(step),vel:choice==='accent'?120:105});
+      arr.sort((a,b)=>a.beat-b.beat);
+      if (choice !== 'accent') markTrackManuallyEdited(block,id);
+      block.generated = false;
+    });
+    redraw();
+    if (choice !== 'accent') preview(choice);
+  }
+  function modifyCurrent(label, mutator) {
+    const block = theBlock(); if (!block) return;
+    withBlockDataUndo(label, block, () => {
+      mutator(block);
+      TRACKS.forEach(([id]) => { if (id !== 'accent' && (block.data[actualId(id)]||[]).length) markTrackManuallyEdited(block,actualId(id)); });
+      block.generated=false;
+    });
+    redraw();
+  }
+  function randomize() {
+    modifyCurrent('Acid 808: random', block => {
+      for (const [id] of TRACKS) {
+        if (id === 'accent') continue;
+        const tid = actualId(id);
+        const chance = ({kick:.29,snare:.13,ohh:.06,chh:.48,crash1:.04,handClap808:.06,cowbell808:.07}[id] || .05);
+        block.data[tid] = [];
+        for(let i=0;i<16;i++) if (Math.random() < chance) block.data[tid].push({beat:beatsForStep(i),vel:75 + Math.floor(Math.random()*46)});
+      }
+      block.data.accent = [0,4,8,12].filter(()=>Math.random()<.65).map(s=>({beat:s/4,vel:120}));
+    });
+  }
+  function clearPattern() {
+    if (!confirm(phrase('Effacer les 16 pas de ce pattern ?', 'Clear all 16 steps in this pattern?'))) return;
+    modifyCurrent('Acid 808: clear pattern', b => {
+      TRACKS.forEach(([id]) => b.data[actualId(id)] = []);
+    });
+  }
+  function copyPattern() {
+    const b=theBlock(); if(!b) return;
+    clipboard=JSON.parse(JSON.stringify(b.data));
+    toast(phrase('Pattern copié','Pattern copied'));
+  }
+  function pastePattern() {
+    if(!clipboard) {toast(phrase('Aucun pattern copié','No pattern copied'));return;}
+    modifyCurrent('Acid 808: paste', b => {
+      TRACKS.forEach(([id]) => {
+        const tid=actualId(id);
+        b.data[tid] = JSON.parse(JSON.stringify(clipboard[tid] || []));
+      });
+    });
+  }
+  function toast(text) { const el=$('a808-message'); if (el) el.textContent=text; }
+  function preview(id) {
+    const r=row(id);
+    if (!r) return;
+    if (norm(id)) deSendMidi('midiNoteOn',{custom:r.paramIndex});
+    else if (r.gm != null) { deSendMidi('midiNoteOn',r.gm); setTimeout(()=>deSendMidi('midiNoteOff',r.gm),115); }
+  }
+  function voiceParameter(rowData, control) {
+    const k=control.key;
+    const v=deVoiceParamStateFor(rowData.family,rowData.paramIndex,k);
+    return (v !== undefined && Number.isFinite(Number(v)))? Number(v) : Number(control.default ?? rowData.defaults[k] ?? control.min);
+  }
+  // On V1.1 the top rotary elements were drawings inside instrument buttons.
+  // V1.1.1 gives each one a real native parameter (level where available).
+  function knobSpec(id) {
+    if (id === 'accent') {
+      const original = $('deAccentAmount');
+      return original ? {
+        key:'accent', min:0, max:100, step:1,
+        get:() => Number(original.value || 0),
+        set:(v, commit) => {
+          original.value=String(v);
+          original.dispatchEvent(new Event('input',{bubbles:true}));
+          if (commit) original.dispatchEvent(new Event('change',{bubbles:true}));
+        }
+      } : null;
+    }
+    const m = row(id);
+    if (!m) return null;
+    const c = (m.controls || []).find(x => ['level','levelKnob','volume','volumeKnob'].includes(x.key));
+    if (c) return {
+      key:c.key, min:Number(c.min), max:Number(c.max),step:Number(c.step) || 0.01,
+      get:() => voiceParameter(m,c),
+      set:(v, commit) => {
+        deSendVoiceParam(m.family,c.key,v,m.paramIndex);
+        if (commit) deSendVoiceParamCommit(m.family,c.key,v,m.paramIndex);
+      }
+    };
+    // Some voices have no circuit Level pot. Use the upstream MIDI-articulation
+    // gain instead of claiming an unsupported synth parameter exists.
+    const voiceTrack = trackList.find(t => t.id===id || t.customInstrument===id);
+    const midiNote = m.gm == null ? voiceTrack?.gm : m.gm;
+    if (midiNote == null) return null;
+    return {
+      key:'articulationLevel',min:0,max:3,step:0.01,
+      get:() => Number(deArticulationGainCache?.[midiNote] ?? 1),
+      set:(v) => { deArticulationGainCache[midiNote]=v; deSendArticulationLevel(midiNote,v); }
+    };
+  }
+  function knobValue(id, spec) {
+    return clamp(knobValues.has(id) ? knobValues.get(id) : spec.get(),spec.min,spec.max);
+  }
+  function drawKnob(id) {
+    const el=$('a808-knob-'+id), spec=knobSpec(id);
+    if (!el || !spec || !Number.isFinite(spec.min) || !Number.isFinite(spec.max) || spec.max<=spec.min) return;
+    const value=knobValue(id,spec);
+    const fraction=(value-spec.min)/(spec.max-spec.min);
+    el.style.setProperty('--a808-angle',(-125+250*fraction).toFixed(2)+'deg');
+    el.setAttribute('aria-valuenow',String(Number(value.toFixed(3))));
+    el.setAttribute('aria-valuemin',String(spec.min));
+    el.setAttribute('aria-valuemax',String(spec.max));
+    el.title='LEVEL : '+value.toFixed(2)+' — '+phrase('glisser haut/bas ou utiliser la molette','drag up/down or use mouse wheel');
+  }
+  function applyKnob(id,raw,commit=false) {
+    const spec=knobSpec(id);
+    if (!spec) return;
+    const increments=Math.round((clamp(Number(raw),spec.min,spec.max)-spec.min)/spec.step);
+    const value=clamp(spec.min+increments*spec.step,spec.min,spec.max);
+    knobValues.set(id,value);
+    spec.set(value,commit);
+    drawKnob(id);
+    // Keep the lower detailed slider synchronized, without sending a duplicate command.
+    if(choice===id) {
+      const detail=$('a808-voice');
+      const slider=detail?.querySelector('input[data-acid-param="'+spec.key+'"]');
+      if(slider) {
+        slider.value=String(value);
+        const output=slider.parentElement?.querySelector('output');
+        if(output) output.textContent=value.toFixed(2);
+      }
+    }
+  }
+  function attachKnob(id,el) {
+    el.setAttribute('role','slider');
+    el.tabIndex=0;
+    el.setAttribute('aria-label',TRACKS.find(t=>t[0]===id)?.[1]+' — volume');
+    const active=knobSpec(id);
+    if (!active) {el.disabled=true;return;}
+    let gesture=null;
+    el.addEventListener('pointerdown',e=>{
+      if(e.button!==0) return;
+      e.preventDefault();e.stopPropagation();
+      choice=id;redraw();
+      const spec=knobSpec(id);
+      gesture={y:e.clientY,value:knobValue(id,spec),changed:false,pointerId:e.pointerId};
+      el.setPointerCapture?.(e.pointerId);
+      el.focus();
+    });
+    el.addEventListener('pointermove',e=>{
+      if(!gesture || e.pointerId!==gesture.pointerId) return;
+      const spec=knobSpec(id);
+      const delta=(gesture.y-e.clientY)/125*(spec.max-spec.min);
+      const candidate=clamp(gesture.value+delta,spec.min,spec.max);
+      if(Math.abs(candidate-knobValue(id,spec))>=spec.step/2) {
+        gesture.changed=true;applyKnob(id,candidate,false);
+      }
+    });
+    const finish=e=>{
+      if(!gesture || e.pointerId!==gesture.pointerId)return;
+      if(gesture.changed) applyKnob(id,knobValue(id,knobSpec(id)),true);
+      gesture=null;
+      try {if(el.hasPointerCapture?.(e.pointerId))el.releasePointerCapture(e.pointerId);}catch(_){}
+    };
+    el.addEventListener('pointerup',finish);
+    el.addEventListener('pointercancel',finish);
+    el.addEventListener('lostpointercapture',e=>{if(gesture&&e.pointerId===gesture.pointerId) finish(e);});
+    el.addEventListener('wheel',e=>{
+      e.preventDefault();e.stopPropagation();
+      const spec=knobSpec(id);
+      const move=e.deltaY<0?1:-1;
+      applyKnob(id,knobValue(id,spec)+move*spec.step*(e.shiftKey?0.25:5),true);
+    },{passive:false});
+    el.addEventListener('keydown',e=>{
+      if(!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;
+      e.preventDefault();e.stopPropagation();
+      const spec=knobSpec(id);
+      const v=e.key==='Home'?spec.min:e.key==='End'?spec.max:
+        knobValue(id,spec)+(['ArrowUp','ArrowRight'].includes(e.key)?1:-1)*spec.step*(e.shiftKey?10:1);
+      applyKnob(id,v,true);
+    });
+    el.addEventListener('dblclick',e=>{
+      e.stopPropagation();
+      const spec=knobSpec(id);
+      const m=row(id);
+      const ctrl=m?.controls?.find(c=>c.key===spec?.key);
+      const def=id==='accent'?0:(ctrl?Number(ctrl.default ?? m.defaults?.[ctrl.key] ?? spec.min):1);
+      applyKnob(id,def,true);
+    });
+    el.addEventListener('click',e=>e.stopPropagation());
+    drawKnob(id);
+  }
+  function instrumentControls(id) {
+    const el=$('a808-voice'); if(!el) return;
+    el.replaceChildren();
+    if (id==='accent') {
+      const label=document.createElement('div'); label.className='a808-voice-heading';label.textContent='ACCENT'; el.appendChild(label);
+      addSlider(el, phrase('Intensité','Strength'),Number($('deAccentAmount')?.value||0),0,100,1,(v)=>{
+        knobValues.set('accent',Number(v));drawKnob('accent');
+        const original=$('deAccentAmount');if(original){original.value=v;original.dispatchEvent(new Event('input',{bubbles:true}));original.dispatchEvent(new Event('change',{bubbles:true}));}
+      });return;
+    }
+    const meta=row(id);
+    if (!meta) {el.textContent='Voix indisponible';return;}
+    const label=document.createElement('div');label.className='a808-voice-heading'; label.textContent=TRACKS.find(t=>t[0]===id)?.[1]||id; el.appendChild(label);
+    const supported=['level','levelKnob','toneKnob','tuningKnob','decayKnob01','snappyKnob'];
+    const controls=(meta.controls||[]).filter(c=>supported.includes(c.key)).slice(0,3);
+    controls.forEach(c=>addSlider(el,c.label,(c.key===knobSpec(id)?.key && knobValues.has(id)) ? knobValues.get(id) : voiceParameter(meta,c),c.min,c.max,c.step,(v,commit)=>{
+      deSendVoiceParam(meta.family,c.key,Number(v),meta.paramIndex);
+      if(c.key===knobSpec(id)?.key) {knobValues.set(id,Number(v));drawKnob(id);}
+      if(commit) deSendVoiceParamCommit(meta.family,c.key,Number(v),meta.paramIndex);
+    }));
+    const audition=document.createElement('button');audition.className='a808-smallbtn';audition.textContent=phrase('ÉCOUTER','PREVIEW');audition.onclick=()=>preview(id);el.appendChild(audition);
+  }
+  function addSlider(parent,name,value,min,max,step,onChange) {
+    const wrap=document.createElement('label'); wrap.className='a808-param';
+    const title=document.createElement('span');title.textContent=name;
+    const readout=document.createElement('output');readout.textContent=Number(value).toFixed(2);
+    const input=document.createElement('input');input.type='range';input.min=min;input.max=max;input.step=step;input.value=value;
+    if (parent.id==='a808-voice' && choice!=='accent') {
+      const r=row(choice),c=(r?.controls||[]).find(c=>c.label===name);
+      if(c) input.dataset.acidParam=c.key;
+    }
+    input.oninput=()=>{readout.textContent=Number(input.value).toFixed(2);onChange(input.value,false);};
+    input.onchange=()=>onChange(input.value,true);
+    wrap.append(title,input,readout);parent.append(wrap);
+  }
+  function redraw() {
+    if(!shell) return;
+    TRACKS.forEach(([id])=>{
+      const btn=$('a808-inst-'+id);if(btn)btn.classList.toggle('chosen',choice===id);
+      drawKnob(id);
+    });
+    for(let s=0;s<16;s++) {
+      const b=$('a808-step-'+s);if(!b)continue;
+      b.classList.toggle('on',Boolean((theBlock()?.data[actualId(choice)]||[]).some(n=>noteStep(n)===s)));
+    }
+    for(let i=0;i<8;i++) {
+      const b=$('a808-pat-'+i); if(b) b.classList.toggle('chosen',patternIndex===i);
+    }
+    if ($('a808-current')) $('a808-current').textContent='PATTERN '+(patternIndex+1);
+    instrumentControls(choice);
+  }
+  function makeShell() {
+    shell=document.createElement('main');shell.id='acid808Shell';
+    shell.innerHTML=`
+      <div class="a808-mainhead">
+        <div><span class="a808-brand">BURNOUT THEORY</span><strong>ACID DRUM <em>808</em></strong><span class="a808-version">V1.1.1</span></div>
+        <div class="a808-playback">
+          <span class="a808-led"></span><span class="a808-sync">FL STUDIO SYNC · 16 STEPS</span>
+          <button id="a808-play">▶ PLAY</button><button id="a808-stop">■ STOP</button>
+          <button id="a808-fr">FR</button><button id="a808-en">EN</button>
+        </div>
+      </div>
+      <div class="a808-instr-title"><span>ANALOG RHYTHM MACHINE — 808 CIRCUIT ENGINE</span><span class="a808-hint">${phrase('Choisir une voix, puis activer les pas','Choose a voice, then toggle steps')}</span></div>
+      <section class="a808-instruments" id="a808-instruments"></section>
+      <section class="a808-workbench">
+        <div class="a808-voice" id="a808-voice"></div>
+        <div class="a808-stepzone">
+          <div class="a808-controls">
+            <div class="a808-row"><small>BANK</small><button class="a808-smallbtn chosen">A</button><small> PATTERN</small><div id="a808-patterns"></div></div>
+            <div class="a808-row a808-actions">
+              <button id="a808-copy">COPY</button><button id="a808-paste">PASTE</button>
+              <button id="a808-clear">CLEAR</button><button id="a808-random">RANDOM 16</button>
+              <span class="a808-swing-label">SHUFFLE</span><input id="a808-swing" type="range" min="0" max="45" step="5" value="0"><span id="a808-swing-value">0%</span>
+            </div>
+          </div>
+          <div class="a808-stepheader"><span id="a808-current">PATTERN 1</span><span>1 BAR · 4/4 · 16 STEPS</span></div>
+          <div class="a808-steps" id="a808-steps"></div>
+          <div class="a808-stepnumbers" id="a808-numbers"></div>
+          <div class="a808-bottominfo"><span id="a808-message"></span><span>808 ENGINE · PROJET SAUVÉ DANS FL STUDIO</span></div>
+        </div>
+      </section>
+      <div class="a808-footer"><span>Basé sur DrumGroover © Reiner Prokein · licence MIT · adaptation Burnout Theory</span>
+      <span>V1.1.1 · potentiomètres interactifs</span></div>`;
+    document.body.appendChild(shell);
+    const instruments=$('a808-instruments');
+    TRACKS.forEach(([id, label])=>{
+      const tile=document.createElement('div');tile.id='a808-inst-'+id;tile.className='a808-instrument';
+      tile.innerHTML=`<button type="button" class="a808-i-select"><span class="a808-i-title">${label}</span></button><button type="button" class="a808-knob-drawing" id="a808-knob-${id}" aria-label="${label} level"></button><span class="a808-i-caption">${id==='accent'?'STRENGTH':'LEVEL'}</span>`;
+      tile.querySelector('.a808-i-select').onclick=()=>{choice=id;redraw();if(id!=='accent')preview(id);};
+      instruments.append(tile);
+      attachKnob(id,$('a808-knob-'+id));
+    });
+    const pats=$('a808-patterns');
+    for(let i=0;i<8;i++){const btn=document.createElement('button');btn.id='a808-pat-'+i;btn.textContent=String(i+1);btn.onclick=()=>activatePattern(i);pats.append(btn);}
+    const steps=$('a808-steps'), numbers=$('a808-numbers');
+    for(let i=0;i<16;i++){
+      const btn=document.createElement('button');btn.type='button';btn.id='a808-step-'+i;btn.dataset.step=String(i);btn.onclick=()=>toggleStep(i);
+      steps.append(btn);
+      const num=document.createElement('span');num.textContent=String(i+1);numbers.append(num);
+    }
+    $('a808-play').onclick=()=>$('playBtn')?.click();
+    $('a808-stop').onclick=()=>$('stopBtn')?.click();
+    $('a808-copy').onclick=copyPattern;
+    $('a808-paste').onclick=pastePattern;
+    $('a808-clear').onclick=clearPattern;
+    $('a808-random').onclick=randomize;
+    $('a808-swing').onchange=()=>{
+      const next=Number($('a808-swing').value);
+      // Swing changes the timing of off-beat steps, not just the visual grid.
+      modifyCurrent('Acid 808: shuffle', b=>{
+        for(const [id] of TRACKS) {
+          if(id==='accent')continue;
+          const notes=(b.data[actualId(id)]||[]);
+          for(const note of notes) {const s=noteStep(note);note.beat=s/4+(s%2?next*.25/100:0);}
+        }
+      });
+      swing=next;
+      $('a808-swing-value').textContent=String(next)+'%';
+    };
+    for(const code of ['fr','en']) $('a808-'+code).onclick=()=>{
+      document.documentElement.setAttribute('data-acid-lang',code);
+      toast(code==='fr'?'Langue : français':'Language: English');
+      const hint=document.querySelector('.a808-hint'); if(hint)hint.textContent=phrase('Choisir une voix, puis activer les pas','Choose a voice, then toggle steps');
+      redraw();
+    };
+    document.documentElement.setAttribute('data-acid-lang','fr');
+  }
+  let tries=0;
+  const startup=setInterval(()=>{
+    try {
+      // Wait for the actual VST3 instrument table and initial sequence creation.
+      if(!INSTRUMENT_TABLE || !trackList.length || !blocksList.length || !activeBlockId) {
+        if(++tries>100){clearInterval(startup);console.warn('Acid Drum V1.1: native engine not ready');}
+        return;
+      }
+      clearInterval(startup);
+      makeShell();initializePatterns();redraw();
+      if(typeof hostBridge !== 'undefined' && hostBridge.on) {
+        hostBridge.on('voiceParamState',()=>{knobValues.clear();redraw();});
+        hostBridge.on('articulationLevelState',()=>{knobValues.clear();redraw();});
+      }
+    } catch(e) {clearInterval(startup);console.error('Acid Drum 808 V1.1 init:',e);
+      const warning=document.createElement('div');warning.style.cssText='position:fixed;left:15px;bottom:15px;background:#551c1c;color:white;padding:15px;z-index:100000';
+      warning.textContent='Erreur interface Acid Drum 808 V1.1 : '+e.message;document.body.append(warning);
+      document.body.classList.add('a808-error');
+    }
+  },200);
+})();

@@ -1,0 +1,33 @@
+ACID DRUM 808 — THIRD-PARTY LICENSE NOTICES
+
+Included upstream notices:
+
+- DrumGroover — copyright (c) 2026 Reiner Prokein — MIT.
+  https://github.com/ReinerBforartists/Drumgroover/blob/main/LICENSE
+- iPlug2 — iPlug2 Developers — zlib-like license.
+  https://github.com/iPlug2/iPlug2/blob/master/LICENSE.txt
+- iPlug2 WebView — copyright (c) 2024 Oliver Larkin — MIT.
+  https://github.com/iPlug2/iPlug2/blob/master/IPlug/Extras/WebView/LICENSE.txt
+- Steinberg VST3 SDK — copyright (c) 2026 Steinberg Media Technologies GmbH — MIT.
+  https://github.com/steinbergmedia/vst3sdk/blob/master/LICENSE.txt
+
+- Cockos WDL — Cockos Incorporated and other contributors — zlib-like license.
+  https://www.cockos.com/wdl/
+- NanoVG — copyright (c) 2013 Mikko Mononen — zlib license.
+  https://github.com/memononen/nanovg/blob/master/LICENSE.txt
+
+Seven license texts are distributed in this folder, plus this notice file.
+
+- Microsoft WIL — Microsoft Corporation — MIT.
+  https://github.com/microsoft/wil/blob/master/LICENSE
+
+IMPORTANT — dependency audit not yet complete:
+The upstream iPlug2 license explicitly references other components (including
+NanoSVG, MetalNanoVG, RTAudio and RTMidi). Determine which
+of these are compiled into this specific binary and supply the applicable
+notices before public distribution. Also review third-party assets and the
+WebView2 runtime requirements. No trademark rights are conferred by these
+software licenses.
+
+The MIT and iPlug2 copyright notices must remain intact in the distributed
+source and corresponding documentation as applicable.
